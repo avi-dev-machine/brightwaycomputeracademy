@@ -8,7 +8,7 @@ from app.schemas.common import ApiResponse, ok
 router = APIRouter()
 
 
-@router.get("/health", response_model=ApiResponse[dict[str, Any]])
+@router.api_route("/health", methods=["GET", "HEAD"], response_model=ApiResponse[dict[str, Any]])
 def health_check(container: ContainerDep) -> ApiResponse[dict[str, Any]]:
     collections = sorted(container.conn.list_collection_names())
     return ok(

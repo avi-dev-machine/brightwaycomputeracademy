@@ -82,8 +82,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     register_exception_handlers(app)
 
-    @app.get("/", tags=["health"])
-    @app.get("/health", tags=["health"])
+    @app.api_route("/", methods=["GET", "HEAD"], tags=["health"])
+    @app.api_route("/health", methods=["GET", "HEAD"], tags=["health"])
     def root_health() -> dict[str, Any]:
         return {
             "success": True,
