@@ -1,15 +1,16 @@
-"""Minimal, checksum-verified SQL migration runner.
+"""Minimal, checksum-verified SQL migration runner for the strict 3-table schema.
 
 Usage (from backend/):
     python -m app.db.migrate status
     python -m app.db.migrate up
 
-Applied migrations are recorded in `schema_migrations`. An applied migration file must
-never be edited; add a new numbered migration instead.
+Tracks applied migration checksums in the `public` schema comment metadata so that
+only the 3 required tables (`students`, `admins`, `fee_payments`) exist in `public`.
 """
 
 import argparse
 import hashlib
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -18,17 +19,10 @@ from pathlib import Path
 import psycopg
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
+_ACTIVE_MIGRATIONS = {"0001_core_schema.sql"}
 _FILENAME = re.compile(r"^(\d{4})_([a-z0-9_]+)\.sql$")
 _LOCK_KEY = 47_112_026
-
-_BOOTSTRAP_SQL = """
-create table if not exists schema_migrations (
-    version text primary key,
-    name text not null,
-    checksum text not null,
-    applied_at timestamptz not null default now()
-)
-"""
+_COMMENT_PREFIX = "brightway_migrations:"
 
 
 class MigrationError(RuntimeError):
@@ -52,11 +46,13 @@ class Migration:
 
 def discover(directory: Path = MIGRATIONS_DIR) -> list[Migration]:
     migrations: list[Migration] = []
+    is_default_dir = directory.resolve() == MIGRATIONS_DIR.resolve()
     for path in sorted(directory.glob("*.sql")):
+        if is_default_dir and path.name not in _ACTIVE_MIGRATIONS:
+            continue
         match = _FILENAME.match(path.name)
         if not match:
             raise MigrationError(f"Invalid migration filename: {path.name}")
-        # Normalise line endings so checksums match across Windows and Linux checkouts.
         sql = path.read_text(encoding="utf-8").replace("\r\n", "\n")
         migrations.append(Migration(match.group(1), match.group(2), sql))
     versions = [m.version for m in migrations]
@@ -66,11 +62,25 @@ def discover(directory: Path = MIGRATIONS_DIR) -> list[Migration]:
 
 
 def _applied(conn: psycopg.Connection) -> dict[str, str]:
-    exists = conn.execute("select to_regclass('schema_migrations')").fetchone()
-    if not exists or exists[0] is None:
+    row = conn.execute(
+        "SELECT obj_description('public'::regnamespace, 'pg_namespace')"
+    ).fetchone()
+    if not row or not row[0] or not str(row[0]).startswith(_COMMENT_PREFIX):
         return {}
-    rows = conn.execute("select version, checksum from schema_migrations").fetchall()
-    return {version: checksum for version, checksum in rows}
+    raw_json = str(row[0])[len(_COMMENT_PREFIX) :]
+    try:
+        data = json.loads(raw_json)
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+    except json.JSONDecodeError:
+        return {}
+    return {}
+
+
+def _save_applied(conn: psycopg.Connection, applied: dict[str, str]) -> None:
+    payload = _COMMENT_PREFIX + json.dumps(applied, sort_keys=True)
+    escaped = payload.replace("'", "''")
+    conn.execute(f"COMMENT ON SCHEMA public IS '{escaped}'")
 
 
 def migrate(database_url: str, directory: Path = MIGRATIONS_DIR) -> list[str]:
@@ -78,9 +88,8 @@ def migrate(database_url: str, directory: Path = MIGRATIONS_DIR) -> list[str]:
     migrations = discover(directory)
     applied_now: list[str] = []
     with psycopg.connect(database_url, autocommit=True, prepare_threshold=None) as conn:
-        conn.execute("select pg_advisory_lock(%s)", (_LOCK_KEY,))
+        conn.execute("SELECT pg_advisory_lock(%s)", (_LOCK_KEY,))
         try:
-            conn.execute(_BOOTSTRAP_SQL)
             applied = _applied(conn)
             for migration in migrations:
                 existing = applied.get(migration.version)
@@ -93,14 +102,11 @@ def migrate(database_url: str, directory: Path = MIGRATIONS_DIR) -> list[str]:
                     continue
                 with conn.transaction():
                     conn.execute(migration.sql)
-                    conn.execute(
-                        "insert into schema_migrations (version, name, checksum) "
-                        "values (%s, %s, %s)",
-                        (migration.version, migration.name, migration.checksum),
-                    )
+                    applied[migration.version] = migration.checksum
+                    _save_applied(conn, applied)
                 applied_now.append(migration.label)
         finally:
-            conn.execute("select pg_advisory_unlock(%s)", (_LOCK_KEY,))
+            conn.execute("SELECT pg_advisory_unlock(%s)", (_LOCK_KEY,))
     return applied_now
 
 

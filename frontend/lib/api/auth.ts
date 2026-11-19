@@ -13,5 +13,5 @@ export const authApi = {
   logout: () =>
     apiRequest<{ ok: boolean }>("/api/auth/logout", { method: "POST", sameOrigin: true }).then((r) => r.data),
   session: () =>
-    apiRequest<{ user: MeOut }>("/api/auth/session", { sameOrigin: true }).then((r) => r.data.user),
+    apiRequest<{ user: MeOut | null }>("/api/auth/session", { sameOrigin: true }).then((r) => r.data.user),
 };

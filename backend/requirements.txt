@@ -9,6 +9,8 @@ anyio==4.15.1
     #   httpx
     #   starlette
     #   watchfiles
+bcrypt==5.0.0
+    # via brightway-backend
 certifi==2026.7.22
     # via
     #   httpcore
@@ -66,6 +68,10 @@ pydantic-settings==2.15.0
     # via brightway-backend
 pyjwt==2.15.1
     # via brightway-backend
+pymongo==4.19.0
+    # via brightway-backend
+dnspython==2.9.1
+    # via pymongo
 python-dotenv==1.2.4
     # via
     #   pydantic-settings

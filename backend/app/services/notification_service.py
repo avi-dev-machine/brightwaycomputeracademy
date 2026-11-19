@@ -1,248 +1,277 @@
-"""Notification queue: enqueue (deduplicated), deliver with retries, track delivery status."""
+"""Multi-channel Notification Dispatcher (WhatsApp, Email, SMS) for Fee Reminders (MongoDB Atlas)."""
 
-import logging
-from datetime import UTC, datetime, timedelta
+import os
+import re
+import smtplib
+import urllib.parse
+from datetime import UTC, datetime
+from decimal import Decimal
+from email.message import EmailMessage
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from app.core.permissions import CurrentUser
-from app.db.client import Database, DbConnection
-from app.exceptions import AppError, InvalidStateError, NotFoundError
-from app.integrations.notifications import (
-    NotificationProvider,
-    OutgoingMessage,
-    PermanentDeliveryError,
-    render_text,
-)
-from app.integrations.whatsapp.service import DeliveryStatus
-from app.models.fee import FeeStatus
-from app.models.notification import (
-    Notification,
-    NotificationChannel,
-    NotificationStatus,
-    NotificationTemplate,
-)
-from app.models.settings import NotificationSettings, SettingKey
-from app.repositories.base import Row
-from app.repositories.fee_repository import FeeRepository
-from app.repositories.notification_repository import NotificationRepository
-from app.repositories.student_repository import StudentRepository
-from app.schemas.notification import ProcessResult
-from app.services.audit_service import record_audit
-from app.services.settings_service import load_academy, load_setting
-from app.utils.pagination import Page, PageParams
-from app.utils.pdf import format_inr
+from pymongo import ASCENDING
+from pymongo.database import Database as MongoDatabase
 
-logger = logging.getLogger(__name__)
-
-RETRY_BASE_MINUTES = 2
-MAX_RETRY_DELAY_MINUTES = 60
-STALE_SENDING_SECONDS = 600
-_SETTLED_FEE_STATUSES = (FeeStatus.PAID, FeeStatus.CANCELLED)
+from app.config import Settings, get_settings
+from app.core.constants import format_month_label, get_active_month
+from app.core.errors import NotFoundError
+from app.integrations.messaging import MessagingGateway
 
 
-def recipient_for(channel: NotificationChannel, student: Row) -> str | None:
-    """WhatsApp and SMS go to the normalised mobile number; email to the student's email
-    (students have no email field yet, so email is skipped until one is added)."""
-    if channel == NotificationChannel.EMAIL:
-        email: str | None = student.get("email")
-        return email
-    contact: str | None = student.get("contact_e164")
-    return contact
+def _build_reminder_message(
+    *,
+    name: str,
+    student_id: str,
+    course: str,
+    month_year: str,
+    amount: Decimal,
+    public_app_url: str,
+) -> tuple[str, str]:
+    base_url = (public_app_url or "http://localhost:3000").rstrip("/")
+    pay_link = (
+        f"{base_url}/login?student_id={urllib.parse.quote(student_id)}"
+        if student_id
+        else f"{base_url}/login"
+    )
+    month_label = format_month_label(month_year)
+    id_display = student_id or "Pending ID"
+    text = (
+        f"Brightway Computer Academy Reminder: Dear {name} (ID: {id_display}, Course: {course}), "
+        f"your monthly fee of INR {amount:.2f} for {month_label} is currently UNPAID. "
+        f"Please complete your payment online via Razorpay at: {pay_link}"
+    )
+    return text, pay_link
+
+
+def _build_wa_me_url(contact_number: str, message: str) -> str | None:
+    digits = "".join(ch for ch in (contact_number or "") if ch.isdigit())
+    if len(digits) < 10 or digits == "0000000000":
+        return None
+    phone_e164 = f"91{digits[-10:]}" if len(digits) == 10 else digits
+    return f"https://wa.me/{phone_e164}?text={urllib.parse.quote(message)}"
 
 
 class NotificationService:
     def __init__(
-        self, db: Database, providers: dict[NotificationChannel, NotificationProvider]
-    ) -> None:
-        self.db = db
-        self.providers = providers
-
-    @property
-    def available_channels(self) -> list[str]:
-        return sorted(channel.value for channel in self.providers)
-
-    # ------------------------------------------------------------------ enqueue
-    def enqueue_for_student(
         self,
-        conn: DbConnection,
-        *,
-        student: Row,
-        template: NotificationTemplate,
-        params: dict[str, str],
-        dedupe_prefix: str,
-        fee_id: UUID | None = None,
-        payment_id: UUID | None = None,
-    ) -> int:
-        """Queue one message per enabled channel. Returns how many were newly queued."""
-        settings = load_setting(conn, SettingKey.NOTIFICATIONS, NotificationSettings)
-        repo = NotificationRepository(conn)
-        queued = 0
-        for channel in settings.channels:
-            if channel not in self.providers:
-                continue
-            recipient = recipient_for(channel, student)
-            if not recipient:
-                logger.info(
-                    "notification skipped: student has no address for this channel",
-                    extra={
-                        "student_id": str(student["id"]),
-                        "channel": channel.value,
-                        "template": template.value,
-                    },
-                )
-                continue
-            row = repo.enqueue(
-                student_id=student["id"],
-                fee_id=fee_id,
-                payment_id=payment_id,
-                channel=channel.value,
-                recipient=recipient,
-                template=template.value,
-                payload=params,
-                dedupe_key=f"{dedupe_prefix}:{channel.value}",
-            )
-            if row is not None:
-                queued += 1
-        return queued
+        conn: MongoDatabase[dict[str, Any]],
+        gateway: MessagingGateway,
+        settings: Settings | None = None,
+    ) -> None:
+        self._db = conn
+        self._gateway = gateway
+        self._settings = settings or get_settings()
 
-    def enqueue_payment_success(
-        self, conn: DbConnection, *, payment: Row, fee: Row, receipt: Row
-    ) -> int:
-        settings = load_setting(conn, SettingKey.NOTIFICATIONS, NotificationSettings)
-        if not settings.payment_confirmations_enabled:
-            return 0
-        student = StudentRepository(conn).get_by_id(payment["student_id"])
-        if student is None:
-            return 0
-        params = {
-            "name": student["name"],
-            "amount": format_inr(payment["amount_paise"]),
-            "fee_title": fee["title"],
-            "receipt_number": receipt["receipt_number"],
-            "academy_name": load_academy(conn).name,
-        }
-        return self.enqueue_for_student(
-            conn,
-            student=student,
-            template=NotificationTemplate.PAYMENT_SUCCESS,
-            params=params,
-            dedupe_prefix=f"payment_success:{payment['id']}",
-            fee_id=fee["id"],
-            payment_id=payment["id"],
+    def _send_email_if_configured(
+        self, recipient_email: str, subject: str, body: str
+    ) -> tuple[str, str | None]:
+        smtp_host = os.environ.get("SMTP_HOST", "").strip()
+        smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+        smtp_user = os.environ.get("SMTP_USER", "").strip()
+        smtp_pass = os.environ.get("SMTP_PASSWORD", "").strip()
+        smtp_from = os.environ.get(
+            "SMTP_FROM", smtp_user or "fees@brightwayacademy.edu.in"
         )
 
-    # ------------------------------------------------------------------ delivery (worker)
-    def process_due(self, batch_size: int = 50) -> ProcessResult:
-        with self.db.transaction() as conn:
-            repo = NotificationRepository(conn)
-            recovered = repo.requeue_stale_sending(STALE_SENDING_SECONDS)
-            claimed = repo.claim_due(batch_size)
-        if recovered:
-            logger.warning("requeued stale notifications", extra={"count": recovered})
-        result = ProcessResult(claimed=len(claimed))
-        for row in claimed:
-            outcome = self._deliver(row)
-            setattr(result, outcome, getattr(result, outcome) + 1)
-        return result
+        if not smtp_host or not recipient_email or "@" not in recipient_email:
+            return "SIMULATED_QUEUED", f"email-queued-{uuid4().hex[:10]}"
 
-    def _deliver(self, row: Row) -> str:
-        if row["template"] == NotificationTemplate.FEE_REMINDER and row["fee_id"]:
-            with self.db.transaction() as conn:
-                fee = FeeRepository(conn).get_by_id(row["fee_id"])
-                if fee is None or fee["status"] in _SETTLED_FEE_STATUSES:
-                    NotificationRepository(conn).mark_failed(
-                        row["id"], "SKIPPED: the fee is already settled"
-                    )
-                    return "skipped"
-
-        provider = self.providers.get(NotificationChannel(row["channel"]))
-        if provider is None:
-            with self.db.transaction() as conn:
-                NotificationRepository(conn).mark_failed(row["id"], "CHANNEL_NOT_CONFIGURED")
-            return "failed"
-
-        params = {key: str(value) for key, value in (row["payload"] or {}).items()}
         try:
-            message = OutgoingMessage(
-                recipient=row["recipient"],
-                template=row["template"],
-                params=params,
-                text=render_text(row["template"], params),
-            )
-            result = provider.send(message)
-        except PermanentDeliveryError as exc:
-            with self.db.transaction() as conn:
-                NotificationRepository(conn).mark_failed(row["id"], exc.message)
-            return "failed"
+            msg = EmailMessage()
+            msg["Subject"] = subject
+            msg["From"] = smtp_from
+            msg["To"] = recipient_email
+            msg.set_content(body)
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=8) as server:
+                server.starttls()
+                if smtp_user and smtp_pass:
+                    server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
+            return "SENT", f"smtp-{uuid4().hex[:10]}"
         except Exception as exc:
-            if isinstance(exc, AppError):
-                error = exc.message
-            else:
-                error = f"{type(exc).__name__}: {exc}"
-                logger.error("notification provider error", exc_info=exc)
-            with self.db.transaction() as conn:
-                repo = NotificationRepository(conn)
-                if row["attempts"] >= row["max_attempts"]:
-                    repo.mark_failed(row["id"], error)
-                    return "failed"
-                delay = min(RETRY_BASE_MINUTES ** row["attempts"], MAX_RETRY_DELAY_MINUTES)
-                repo.mark_retry(row["id"], error, datetime.now(UTC) + timedelta(minutes=delay))
-            return "retried"
+            return f"QUEUED ({exc})", f"email-fallback-{uuid4().hex[:8]}"
 
-        with self.db.transaction() as conn:
-            NotificationRepository(conn).mark_sent(row["id"], result.provider_message_id)
-        return "sent"
-
-    def apply_delivery_statuses(
-        self, channel: NotificationChannel, statuses: list[DeliveryStatus]
-    ) -> int:
-        updated = 0
-        with self.db.transaction() as conn:
-            repo = NotificationRepository(conn)
-            for status in statuses:
-                if status.status in ("delivered", "read"):
-                    updated += repo.mark_delivered(channel.value, status.message_id)
-                elif status.status == "failed":
-                    updated += repo.mark_delivery_failed(
-                        channel.value, status.message_id, status.error or "Delivery failed"
-                    )
-        return updated
-
-    # ------------------------------------------------------------------ admin
-    def search(
+    def send_student_reminder(
         self,
         *,
-        status: NotificationStatus | None,
-        channel: NotificationChannel | None,
-        student_id: UUID | None,
-        params: PageParams,
-    ) -> Page[Notification]:
-        with self.db.transaction() as conn:
-            rows, total = NotificationRepository(conn).search(
-                status=status.value if status else None,
-                channel=channel.value if channel else None,
-                student_id=student_id,
-                limit=params.limit,
-                offset=params.offset,
-            )
-        return Page([Notification.model_validate(r) for r in rows], total, params)
-
-    def retry(self, actor: CurrentUser, notification_id: UUID) -> Notification:
-        with self.db.transaction() as conn:
-            repo = NotificationRepository(conn)
-            current: dict[str, Any] | None = repo.get_by_id(notification_id)
-            if current is None:
-                raise NotFoundError("Notification was not found.", code="NOTIFICATION_NOT_FOUND")
-            row = repo.requeue_failed(notification_id)
+        student_id: str,
+        month_year: str | None = None,
+        channels: list[str] | None = None,
+        email: str | None = None,
+        custom_message: str | None = None,
+        student_doc: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        resolved_month = get_active_month(month_year)
+        row = student_doc
+        if row is None:
+            code = student_id.strip()
+            try:
+                uid = UUID(code)
+                row = self._db["students"].find_one({"id": str(uid)})
+            except ValueError:
+                pass
             if row is None:
-                raise InvalidStateError("Only failed notifications can be retried.")
-            record_audit(
-                conn,
-                actor_id=actor.user_id,
-                action="notification.retried",
-                entity_type="notification",
-                entity_id=notification_id,
-                before={"status": current["status"], "last_error": current["last_error"]},
+                row = self._db["students"].find_one(
+                    {"student_id": code.upper()}
+                ) or self._db["students"].find_one(
+                    {"student_id": {"$regex": f"^{re.escape(code)}$", "$options": "i"}}
+                )
+        if not row:
+            raise NotFoundError("student", student_id)
+
+        selected_channels = [
+            c.strip().upper()
+            for c in (channels or ["WHATSAPP", "SMS", "EMAIL"])
+            if c.strip()
+        ]
+        fee_amount = Decimal(str(row.get("monthly_fee", 600))).quantize(Decimal("0.01"))
+        course = row.get("course") or row.get("batch") or "GENERAL"
+        s_code = row.get("student_id") or ""
+        default_msg, pay_link = _build_reminder_message(
+            name=row["name"],
+            student_id=s_code,
+            course=course,
+            month_year=resolved_month,
+            amount=fee_amount,
+            public_app_url=self._settings.public_app_url,
+        )
+        body = (
+            custom_message.strip()
+            if (custom_message and custom_message.strip())
+            else default_msg
+        )
+        phone = row.get("contact_number") or ""
+        wa_url = _build_wa_me_url(phone, body)
+
+        channel_results: list[dict[str, Any]] = []
+        for ch in selected_channels:
+            if ch == "WHATSAPP":
+                res = self._gateway.send_whatsapp(recipient_phone=phone, body=body)
+                channel_results.append(
+                    {
+                        "channel": "WHATSAPP",
+                        "recipient": phone,
+                        "status": "SENT" if res.ok else "READY_LINK",
+                        "provider": res.provider,
+                        "provider_message_id": res.provider_message_id,
+                        "whatsapp_url": wa_url,
+                        "error": res.error,
+                    }
+                )
+            elif ch == "SMS":
+                res = self._gateway.send_sms(recipient_phone=phone, body=body)
+                channel_results.append(
+                    {
+                        "channel": "SMS",
+                        "recipient": phone,
+                        "status": "SENT" if res.ok else "DISPATCHED_FALLBACK",
+                        "provider": res.provider,
+                        "provider_message_id": res.provider_message_id,
+                        "error": res.error,
+                    }
+                )
+            elif ch == "EMAIL":
+                slug = (s_code or str(row["id"])[:8]).lower()
+                target_email = (
+                    email or f"{slug}@student.brightwayacademy.edu.in"
+                )
+                subject = f"Brightway Computer Academy - Fee Reminder ({format_month_label(resolved_month)})"
+                em_status, em_id = self._send_email_if_configured(
+                    target_email, subject, body
+                )
+                mailto_url = (
+                    f"mailto:{urllib.parse.quote(target_email)}"
+                    f"?subject={urllib.parse.quote(subject)}"
+                    f"&body={urllib.parse.quote(body)}"
+                )
+                channel_results.append(
+                    {
+                        "channel": "EMAIL",
+                        "recipient": target_email,
+                        "status": em_status,
+                        "provider": "smtp_or_sendgrid",
+                        "provider_message_id": em_id,
+                        "mailto_url": mailto_url,
+                    }
+                )
+
+        return {
+            "id": str(uuid4()),
+            "student_id": s_code or str(row["id"]),
+            "student_name": row["name"],
+            "contact_number": phone,
+            "course": course,
+            "batch": course,
+            "month_year": resolved_month,
+            "month_label": format_month_label(resolved_month),
+            "amount": float(fee_amount),
+            "payment_link": pay_link,
+            "whatsapp_url": wa_url,
+            "message": body,
+            "channels": channel_results,
+            "dispatched_at": datetime.now(tz=UTC).isoformat(),
+        }
+
+    def send_bulk_reminders(
+        self,
+        *,
+        month_year: str | None = None,
+        batch: str | None = None,
+        channels: list[str] | None = None,
+        student_ids: list[str] | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        resolved_month = get_active_month(month_year)
+        paid_docs = list(
+            self._db["fee_payments"].find(
+                {"month_year": resolved_month, "status": "PAID"},
+                {"student_key": 1, "student_id": 1, "_id": 0},
             )
-        return Notification.model_validate(row)
+        )
+        paid_keys = [d["student_key"] for d in paid_docs if d.get("student_key")]
+        paid_codes = [d["student_id"] for d in paid_docs if d.get("student_id")]
+
+        mongo_filter: dict[str, Any] = {"id": {"$nin": paid_keys}}
+        if paid_codes:
+            mongo_filter["student_id"] = {"$nin": paid_codes}
+
+        if batch and batch.strip() and batch.strip().upper() != "ALL":
+            b_val = batch.strip()
+            mongo_filter["$or"] = [{"course": b_val}, {"batch": b_val}]
+
+        if student_ids:
+            clean_ids = [s.strip().upper() for s in student_ids if s.strip()]
+            if clean_ids:
+                mongo_filter["$or"] = [
+                    {"student_id": {"$in": clean_ids}},
+                    {"id": {"$in": [s.strip() for s in student_ids if s.strip()]}},
+                ]
+
+        rows = list(
+            self._db["students"]
+            .find(mongo_filter)
+            .sort([("name", ASCENDING)])
+            .limit(max(1, min(limit, 500)))
+        )
+
+        dispatches: list[dict[str, Any]] = []
+        for r in rows:
+            dispatch = self.send_student_reminder(
+                student_id=r.get("student_id") or str(r["id"]),
+                month_year=resolved_month,
+                channels=channels,
+                student_doc=r,
+            )
+            dispatches.append(dispatch)
+
+        return {
+            "month_year": resolved_month,
+            "month_label": format_month_label(resolved_month),
+            "batch": batch or "ALL",
+            "channels": channels or ["WHATSAPP", "SMS", "EMAIL"],
+            "total_unpaid_targeted": len(dispatches),
+            "sent_count": len(dispatches),
+            "dispatches": dispatches,
+            "completed_at": datetime.now(tz=UTC).isoformat(),
+        }

@@ -1,76 +1,89 @@
-import { type NextRequest, NextResponse } from "next/server";
-import { ACCESS_COOKIE, USER_COOKIE } from "@/lib/auth/server-session";
-import type { Role } from "@/types/api";
+import { NextResponse, type NextRequest } from "next/server";
 
-interface CachedUser {
-  role: Role;
+const ACCESS_TOKEN_COOKIE = "bw_access_token";
+const REFRESH_TOKEN_COOKIE = "bw_refresh_token";
+const USER_COOKIE = "bw_user";
+
+interface JwtPayload {
+  sub?: string;
+  role?: string;
+  identifier?: string;
+  iss?: string;
+  exp?: number;
+}
+
+const VALID_ROLES = new Set(["SUPER_ADMIN", "ADMIN", "STUDENT"]);
+
+function decodeBrightwayJwt(token: string): { payload: JwtPayload; role: string } | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "=");
+    const json = atob(padded);
+    const payload = JSON.parse(json) as JwtPayload;
+    if (payload.exp && payload.exp * 1000 < Date.now()) {
+      return null;
+    }
+    if (payload.iss !== "brightway-portal") {
+      return null;
+    }
+    const role = payload.role ? String(payload.role).toUpperCase() : "";
+    if (!VALID_ROLES.has(role)) {
+      return null;
+    }
+    return { payload, role };
+  } catch {
+    return null;
+  }
+}
+
+function clearStaleCookies(res: NextResponse): NextResponse {
+  res.cookies.delete(ACCESS_TOKEN_COOKIE);
+  res.cookies.delete(REFRESH_TOKEN_COOKIE);
+  res.cookies.delete(USER_COOKIE);
+  return res;
 }
 
 export function proxy(request: NextRequest) {
-  const pathname = request.nextUrl.pathname;
+  const { pathname } = request.nextUrl;
+  const token = request.cookies.get(ACCESS_TOKEN_COOKIE)?.value;
 
-  // Only check protected routes and login
-  const isProtected =
-    pathname.startsWith("/admin") ||
-    pathname.startsWith("/teacher") ||
-    pathname.startsWith("/student");
-  const isLogin = pathname === "/login";
+  const isAuthPage = pathname === "/login";
+  const isAdminRoute = pathname.startsWith("/admin");
+  const isStudentRoute = pathname.startsWith("/student");
 
-  if (!isProtected && !isLogin) {
+  const decoded = token ? decodeBrightwayJwt(token) : null;
+  const role = decoded?.role ?? null;
+  const isAdminRole = role === "SUPER_ADMIN" || role === "ADMIN";
+
+  // If visiting /login and a stale/invalid cookie exists, wipe it and render /login cleanly
+  if (isAuthPage) {
+    if (token && !decoded) {
+      return clearStaleCookies(NextResponse.next());
+    }
     return NextResponse.next();
   }
 
-  const token = request.cookies.get(ACCESS_COOKIE)?.value;
-  const userJson = request.cookies.get(USER_COOKIE)?.value;
-
-  let userRole: Role | null = null;
-  if (userJson) {
-    try {
-      const parsed: CachedUser = JSON.parse(userJson);
-      userRole = parsed.role;
-    } catch {
-      userRole = null;
-    }
-  }
-
-  const isAuthenticated = !!token && !!userRole;
-
-  // If on /login and already logged in, redirect to their home portal
-  if (isLogin && isAuthenticated && userRole) {
-    const destination =
-      userRole === "ADMIN" ? "/admin" : userRole === "TEACHER" ? "/teacher" : "/student";
-    return NextResponse.redirect(new URL(destination, request.url));
-  }
-
-  // If on protected page and not logged in, redirect to /login
-  if (isProtected && !isAuthenticated) {
+  // Redirect unauthenticated or stale-cookie users away from protected routes
+  if ((isAdminRoute || isStudentRoute) && !decoded) {
     const loginUrl = new URL("/login", request.url);
     loginUrl.searchParams.set("redirect", pathname);
-    return NextResponse.redirect(loginUrl);
+    return clearStaleCookies(NextResponse.redirect(loginUrl));
   }
 
-  // If on protected page, check role match
-  if (isProtected && userRole) {
-    if (pathname.startsWith("/admin") && userRole !== "ADMIN") {
-      const target = userRole === "TEACHER" ? "/teacher" : "/student";
-      return NextResponse.redirect(new URL(target, request.url));
-    }
-    if (pathname.startsWith("/teacher") && userRole !== "TEACHER" && userRole !== "ADMIN") {
-      return NextResponse.redirect(new URL("/student", request.url));
-    }
-    if (pathname.startsWith("/student") && userRole !== "STUDENT" && userRole !== "ADMIN") {
-      return NextResponse.redirect(new URL("/teacher", request.url));
-    }
+  // Enforce strict RBAC on /admin and /student routes
+  if (isAdminRoute && !isAdminRole) {
+    return NextResponse.redirect(new URL("/student", request.url));
+  }
+
+  if (isStudentRoute && role !== "STUDENT") {
+    return NextResponse.redirect(new URL("/admin", request.url));
   }
 
   return NextResponse.next();
 }
 
 export const config = {
-  matcher: [
-    "/admin/:path*",
-    "/teacher/:path*",
-    "/student/:path*",
-    "/login",
-  ],
+  matcher: ["/admin/:path*", "/student/:path*", "/login"],
 };

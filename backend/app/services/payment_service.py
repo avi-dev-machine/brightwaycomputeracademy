@@ -1,755 +1,591 @@
-"""Payment domain: orders, verification, webhooks, offline payments and refunds.
+"""Server-side Razorpay Order Creation, Cryptographic Verification, and Monthly Fee Status Service (MongoDB Atlas).
 
-Independent of Razorpay: it talks to a PaymentProvider. Every settlement runs in one
-database transaction with the payment row locked (SELECT ... FOR UPDATE), so a payment
-can never be applied twice, whatever mix of checkout callbacks and duplicate webhooks
-arrives.
+Supports both online Razorpay payments and Admin one-click PAID/UNPAID toggles for any student
+(by UUID `id` or `student_id`) for the active month (defaulting to December 2027, `2027-12`),
+while preserving all historical months in the backend `fee_payments` collection.
 """
 
-import logging
-from dataclasses import dataclass
-from datetime import UTC, datetime, time, timedelta
-from enum import StrEnum
-from uuid import UUID
-from zoneinfo import ZoneInfo
+import json
+import re
+from datetime import UTC, datetime
+from decimal import Decimal
+from typing import Any
+from uuid import UUID, uuid4
 
-from app.core.constants import CURRENCY, MIN_ONLINE_PAYMENT_PAISE
-from app.core.permissions import CurrentUser
-from app.db.client import Database, DbConnection
-from app.exceptions import (
-    AppError,
+from fpdf import FPDF
+from pymongo import ReturnDocument
+from pymongo.database import Database as MongoDatabase
+
+from app.core.constants import CURRENCY, format_month_label, get_active_month
+from app.core.errors import (
     ConflictError,
-    ExternalServiceError,
-    ForbiddenError,
-    InvalidStateError,
     NotFoundError,
     PaymentVerificationError,
-    ValidationFailedError,
+    ValidationError,
 )
-from app.integrations.payments import (
-    PaymentProvider,
-    ProviderPayment,
-    ProviderRefund,
-    ProviderWebhookEvent,
-)
-from app.models.fee import FeeStatus, compute_fee_status, outstanding
-from app.models.payment import (
-    Payment,
-    PaymentProviderName,
-    PaymentStatus,
-    can_transition,
-    ensure_transition,
-)
-from app.models.receipt import Receipt
-from app.repositories.base import Row
-from app.repositories.fee_repository import FeeRepository
-from app.repositories.payment_repository import PaymentEventRepository, PaymentRepository
-from app.repositories.receipt_repository import ReceiptRepository
-from app.repositories.student_repository import StudentRepository
-from app.schemas.payment import (
-    CheckoutOrder,
-    CreateOrderRequest,
-    OfflinePaymentRequest,
-    PaymentConfig,
-    PaymentResult,
-    StudentUpiPaymentRequest,
-    VerifyPaymentRequest,
-    WebhookResult,
-)
-from app.services.audit_service import record_audit
-from app.services.notification_service import NotificationService
-from app.services.receipt_service import ReceiptService
-from app.utils.dates import local_today
+from app.core.permissions import assert_student_self_or_staff
+from app.core.security import CurrentUser
+from app.integrations.razorpay import RazorpayGateway
 from app.utils.pagination import Page, PageParams
 
-logger = logging.getLogger(__name__)
-
-ORDER_REUSE_WINDOW = timedelta(minutes=30)
-_SETTLEMENT_EVENTS = {"payment.captured", "order.paid", "payment.authorized", "payment.failed"}
+_MONTH_YEAR_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
 
-class Outcome(StrEnum):
-    SUCCEEDED = "SUCCEEDED"
-    ALREADY_PROCESSED = "ALREADY_PROCESSED"
-    PENDING = "PENDING"
-    FAILED = "FAILED"
-    REFUNDED = "REFUNDED"
-    AMOUNT_MISMATCH = "AMOUNT_MISMATCH"
-    ORDER_MISMATCH = "ORDER_MISMATCH"
-    REVIEW_REQUIRED = "REVIEW_REQUIRED"
-    IGNORED = "IGNORED"
+def _validate_month_year(month_year: str | None) -> str:
+    val = get_active_month(month_year)
+    if not _MONTH_YEAR_RE.match(val):
+        raise ValidationError("month_year must be in YYYY-MM format (e.g. 2027-12).")
+    return val
 
 
-_VERIFICATION_FAILURES = {Outcome.AMOUNT_MISMATCH, Outcome.ORDER_MISMATCH}
-
-
-@dataclass
-class Settlement:
-    payment: Row
-    receipt: Row | None
-    outcome: Outcome
-
-
-def payment_not_found() -> NotFoundError:
-    return NotFoundError("Payment was not found.", code="PAYMENT_NOT_FOUND")
+def _format_payment_row(
+    row: dict[str, Any], student_name: str | None = None, course: str | None = None
+) -> dict[str, Any]:
+    amt = Decimal(str(row.get("amount", 0))).quantize(Decimal("0.01"))
+    p_date = row.get("payment_date")
+    p_iso = p_date.isoformat() if isinstance(p_date, datetime) else p_date
+    m_yr = row.get("month_year") or get_active_month()
+    c_val = course or row.get("course") or row.get("batch")
+    return {
+        "id": str(row["id"]),
+        "student_key": row.get("student_key"),
+        "student_id": row.get("student_id") or "",
+        "student_name": student_name or row.get("student_name"),
+        "course": c_val,
+        "batch": c_val,
+        "amount": float(amt),
+        "amount_paise": int(amt * 100),
+        "currency": CURRENCY,
+        "month": m_yr,
+        "month_year": m_yr,
+        "month_label": format_month_label(m_yr),
+        "razorpay_order_id": row.get("razorpay_order_id"),
+        "razorpay_payment_id": row.get("razorpay_payment_id"),
+        "status": row.get("status", "UNPAID"),
+        "payment_date": p_iso,
+        "paid_at": p_iso,
+        "method": "RAZORPAY" if row.get("razorpay_payment_id") else "ADMIN",
+    }
 
 
 class PaymentService:
     def __init__(
         self,
-        db: Database,
-        provider: PaymentProvider,
-        receipts: ReceiptService,
-        notifications: NotificationService,
-        timezone: str,
+        conn: MongoDatabase[dict[str, Any]],
+        gateway: RazorpayGateway,
     ) -> None:
-        self.db = db
-        self.provider = provider
-        self.receipts = receipts
-        self.notifications = notifications
-        self.timezone = timezone
+        self._db = conn
+        self._gateway = gateway
 
-    def config(self) -> PaymentConfig:
-        return PaymentConfig(
-            provider=self.provider.name, key_id=self.provider.checkout_key, currency=CURRENCY
-        )
+    def _resolve_student(
+        self, actor: CurrentUser, requested_student_id: str | UUID | None = None
+    ) -> dict[str, Any]:
+        target = requested_student_id
+        if target is None:
+            target = actor.id or actor.student_id
 
-    # ------------------------------------------------------------------ online checkout
-    def create_order(
-        self, user: CurrentUser, payload: CreateOrderRequest, idempotency_key: str | None
-    ) -> CheckoutOrder:
-        if not (user.is_admin or user.is_student):
-            raise ForbiddenError()
-        with self.db.transaction() as conn:
-            fee = FeeRepository(conn).get_by_id(payload.fee_id, for_update=True)
-            if fee is None:
-                raise NotFoundError("Fee was not found.", code="FEE_NOT_FOUND")
-            if user.is_student and fee["student_id"] != user.student_id:
-                raise ForbiddenError("You can only pay your own fees.")
-            payments = PaymentRepository(conn)
-            if idempotency_key:
-                existing = payments.get_by_idempotency_key(idempotency_key)
-                if existing is not None:
-                    return self._replay_order(conn, existing, fee, payload)
-            amount = self._payable_amount(fee, payload.amount_paise)
-            if amount < MIN_ONLINE_PAYMENT_PAISE:
-                raise ValidationFailedError(
-                    "The minimum online payment is INR 1.00.", code="AMOUNT_TOO_SMALL"
-                )
-            reusable = payments.find_open_order(
-                fee_id=fee["id"],
-                amount_paise=amount,
-                provider=self.provider.name,
-                created_after=datetime.now(UTC) - ORDER_REUSE_WINDOW,
-            )
-            if reusable is not None:
-                return self._checkout(conn, reusable, fee)
-            payment = payments.insert(
-                {
-                    "fee_id": fee["id"],
-                    "student_id": fee["student_id"],
-                    "amount_paise": amount,
-                    "currency": CURRENCY,
-                    "provider": self.provider.name,
-                    "status": PaymentStatus.CREATED,
-                    "idempotency_key": idempotency_key,
-                    "created_by": user.user_id,
-                }
-            )
-
-        # The provider call happens outside the transaction so no row locks are held
-        # during network I/O.
+        row = None
         try:
-            order = self.provider.create_order(
-                amount_paise=amount,
-                currency=CURRENCY,
-                receipt=payment["id"].hex[:40],
-                notes={
-                    "payment_id": str(payment["id"]),
-                    "fee_id": str(fee["id"]),
-                    "student_id": str(fee["student_id"]),
-                },
-            )
-            if order.amount_paise != amount or order.currency != CURRENCY:
-                raise ExternalServiceError("The payment provider returned an unexpected order.")
-        except AppError:
-            with self.db.transaction() as conn:
-                PaymentRepository(conn).update_fields(
-                    payment["id"],
-                    {"status": PaymentStatus.FAILED, "failure_reason": "ORDER_CREATION_FAILED"},
-                )
-            raise
+            uid = UUID(str(target))
+            row = self._db["students"].find_one({"id": str(uid)})
+        except ValueError:
+            pass
 
-        with self.db.transaction() as conn:
-            updated = PaymentRepository(conn).update_fields(
-                payment["id"], {"provider_order_id": order.order_id}
-            )
-            assert updated is not None
-            record_audit(
-                conn,
-                actor_id=user.user_id,
-                action="payment.order_created",
-                entity_type="payment",
-                entity_id=payment["id"],
-                after=updated,
-            )
-            return self._checkout(conn, updated, fee)
-
-    def verify_checkout(self, user: CurrentUser, payload: VerifyPaymentRequest) -> PaymentResult:
-        with self.db.transaction() as conn:
-            payment = PaymentRepository(conn).get_by_order_id(payload.provider_order_id)
-        if payment is None:
-            raise payment_not_found()
-        self._ensure_access(user, payment)
-        if not self.provider.verify_checkout_signature(
-            order_id=payload.provider_order_id,
-            payment_id=payload.provider_payment_id,
-            signature=payload.signature,
-        ):
-            with self.db.transaction() as conn:
-                record_audit(
-                    conn,
-                    actor_id=user.user_id,
-                    action="payment.signature_rejected",
-                    entity_type="payment",
-                    entity_id=payment["id"],
-                )
-            raise PaymentVerificationError(
-                "Payment signature is invalid.", code="INVALID_PAYMENT_SIGNATURE"
-            )
-        # Never trust the browser's success callback alone: confirm with the provider.
-        remote = self.provider.fetch_payment(payload.provider_payment_id)
-        settlement = self._apply_provider_payment(payment["id"], remote, actor_id=user.user_id)
-        return self._result(settlement)
-
-    # ------------------------------------------------------------------ webhooks
-    def handle_webhook(
-        self, body: bytes, signature: str | None, event_id: str | None
-    ) -> WebhookResult:
-        if not signature or not self.provider.verify_webhook_signature(body, signature):
-            raise PaymentVerificationError(
-                "Invalid webhook signature.", code="INVALID_WEBHOOK_SIGNATURE"
-            )
-        event = self.provider.parse_webhook(body, event_id)
-        with self.db.transaction() as conn:
-            events = PaymentEventRepository(conn)
-            stored = events.insert_if_new(
-                provider=self.provider.name,
-                event_id=event.event_id,
-                event_type=event.event_type,
-                payload=event.payload,
-            )
-            if stored is None:
-                stored = events.get(self.provider.name, event.event_id)
-                assert stored is not None
-                if stored["status"] in ("PROCESSED", "IGNORED"):
-                    return WebhookResult(status="duplicate", detail=stored["result"])
-        try:
-            outcome, detail = self._process_event(event)
-        except Exception as exc:
-            with self.db.transaction() as conn:
-                PaymentEventRepository(conn).mark(
-                    stored["id"], status="FAILED", result=type(exc).__name__
-                )
-            raise
-        with self.db.transaction() as conn:
-            PaymentEventRepository(conn).mark(
-                stored["id"],
-                status="IGNORED" if outcome == Outcome.IGNORED else "PROCESSED",
-                result=outcome.value,
-            )
-        return WebhookResult(status=outcome.value.lower(), detail=detail)
-
-    def _process_event(self, event: ProviderWebhookEvent) -> tuple[Outcome, str | None]:
-        if event.event_type in _SETTLEMENT_EVENTS:
-            if event.payment is None or not event.order_id:
-                return Outcome.IGNORED, "event has no payment"
-            with self.db.transaction() as conn:
-                payment = PaymentRepository(conn).get_by_order_id(event.order_id)
-            if payment is None:
-                logger.warning("webhook for an unknown order", extra={"order_id": event.order_id})
-                return Outcome.IGNORED, "unknown order"
-            # The webhook body is signed by the provider, so its payment entity is trusted.
-            settlement = self._apply_provider_payment(payment["id"], event.payment, actor_id=None)
-            return settlement.outcome, None
-        if event.event_type == "refund.processed" and event.refund is not None:
-            return self._apply_refund(event.refund), None
-        return Outcome.IGNORED, f"unhandled event {event.event_type}"
-
-    # ------------------------------------------------------------------ offline payments
-    def record_offline_payment(
-        self, actor: CurrentUser, fee_id: UUID, payload: OfflinePaymentRequest
-    ) -> PaymentResult:
-        today = local_today(self.timezone)
-        if payload.paid_on and payload.paid_on > today:
-            raise ValidationFailedError("paid_on cannot be in the future.", code="FUTURE_DATE")
-        if payload.paid_on is None or payload.paid_on == today:
-            paid_at = datetime.now(UTC)
-        else:
-            paid_at = datetime.combine(payload.paid_on, time(12, 0), tzinfo=ZoneInfo(self.timezone))
-
-        with self.db.transaction() as conn:
-            payments = PaymentRepository(conn)
-            if payload.idempotency_key:
-                existing = payments.get_by_idempotency_key(payload.idempotency_key)
-                if existing is not None:
-                    if (
-                        existing["fee_id"] != fee_id
-                        or existing["amount_paise"] != payload.amount_paise
-                    ):
-                        raise _idempotency_conflict()
-                    receipt = ReceiptRepository(conn).get_by_payment(existing["id"])
-                    return self._result(Settlement(existing, receipt, Outcome.ALREADY_PROCESSED))
-            fee = FeeRepository(conn).get_by_id(fee_id, for_update=True)
-            if fee is None:
-                raise NotFoundError("Fee was not found.", code="FEE_NOT_FOUND")
-            amount = self._payable_amount(fee, payload.amount_paise)
-            payment = payments.insert(
-                {
-                    "fee_id": fee_id,
-                    "student_id": fee["student_id"],
-                    "amount_paise": amount,
-                    "currency": CURRENCY,
-                    "provider": PaymentProviderName.OFFLINE,
-                    "method": payload.method,
-                    "status": PaymentStatus.CREATED,
-                    "idempotency_key": payload.idempotency_key,
-                    "reference": payload.reference,
-                    "notes": payload.notes,
-                    "created_by": actor.user_id,
-                }
-            )
-            settlement = self._record_success(
-                conn,
-                payment,
-                amount_paise=amount,
-                currency=CURRENCY,
-                provider_payment_id=None,
-                method=payload.method.value,
-                actor_id=actor.user_id,
-                paid_at=paid_at,
-            )
-        self._generate_receipt_pdf(settlement)
-        return self._result(settlement)
-
-    def record_student_upi_payment(
-        self, actor: CurrentUser, fee_id: UUID, payload: StudentUpiPaymentRequest
-    ) -> PaymentResult:
-        if actor.is_teacher:
-            raise ForbiddenError("Teachers cannot process student fees.")
-
-        with self.db.transaction() as conn:
-            payments = PaymentRepository(conn)
-            if payload.idempotency_key:
-                existing = payments.get_by_idempotency_key(payload.idempotency_key)
-                if existing is not None:
-                    receipt = ReceiptRepository(conn).get_by_payment(existing["id"])
-                    return self._result(Settlement(existing, receipt, Outcome.ALREADY_PROCESSED))
-
-            fee = FeeRepository(conn).get_by_id(fee_id, for_update=True)
-            if fee is None:
-                raise NotFoundError("Fee was not found.", code="FEE_NOT_FOUND")
-
-            if actor.is_student and fee["student_id"] != actor.student_id:
-                raise ForbiddenError("You can only pay for your own fees.")
-
-            amount = fee["balance_paise"]
-            if amount <= 0:
-                raise ValidationFailedError("This fee has already been settled.", code="FEE_ALREADY_PAID")
-
-            payment = payments.insert(
-                {
-                    "fee_id": fee_id,
-                    "student_id": fee["student_id"],
-                    "amount_paise": amount,
-                    "currency": CURRENCY,
-                    "provider": PaymentProviderName.OFFLINE,
-                    "method": "UPI",
-                    "status": PaymentStatus.CREATED,
-                    "idempotency_key": payload.idempotency_key,
-                    "reference": payload.reference or f"UPI-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}",
-                    "notes": payload.notes or "Paid via Direct UPI / Dynamic QR Code",
-                    "created_by": actor.user_id,
-                }
-            )
-            settlement = self._record_success(
-                conn,
-                payment,
-                amount_paise=amount,
-                currency=CURRENCY,
-                provider_payment_id=None,
-                method="UPI",
-                actor_id=actor.user_id,
-                paid_at=datetime.now(UTC),
-            )
-        self._generate_receipt_pdf(settlement)
-        return self._result(settlement)
-
-    # ------------------------------------------------------------------ queries
-    def search(
-        self,
-        user: CurrentUser,
-        *,
-        student_id: UUID | None,
-        fee_id: UUID | None,
-        status: PaymentStatus | None,
-        params: PageParams,
-    ) -> Page[Payment]:
-        if user.is_teacher:
-            raise ForbiddenError()
-        if user.is_student:
-            if student_id is not None and student_id != user.student_id:
-                raise ForbiddenError("You can only view your own payments.")
-            student_id = user.student_id
-        with self.db.transaction() as conn:
-            rows, total = PaymentRepository(conn).search(
-                student_id=student_id,
-                fee_id=fee_id,
-                status=status.value if status else None,
-                limit=params.limit,
-                offset=params.offset,
-            )
-        return Page([Payment.model_validate(r) for r in rows], total, params)
-
-    def get(self, user: CurrentUser, payment_id: UUID) -> Payment:
-        with self.db.transaction() as conn:
-            row = PaymentRepository(conn).get_by_id(payment_id)
         if row is None:
-            raise payment_not_found()
-        self._ensure_access(user, row)
-        return Payment.model_validate(row)
+            code = str(target).strip()
+            if code:
+                row = self._db["students"].find_one(
+                    {"student_id": code.upper()}
+                ) or self._db["students"].find_one(
+                    {"student_id": {"$regex": f"^{re.escape(code)}$", "$options": "i"}}
+                )
 
-    # ------------------------------------------------------------------ settlement core
-    def _apply_provider_payment(
-        self, payment_id: UUID, remote: ProviderPayment, *, actor_id: UUID | None
-    ) -> Settlement:
-        with self.db.transaction() as conn:
-            payment = PaymentRepository(conn).get_by_id(payment_id, for_update=True)
-            assert payment is not None
-            if remote.order_id != payment["provider_order_id"]:
-                flagged = self._flag_review(
-                    conn,
-                    payment,
-                    f"ORDER_MISMATCH: provider payment {remote.payment_id} belongs to order "
-                    f"{remote.order_id}",
-                )
-                settlement = Settlement(flagged, None, Outcome.ORDER_MISMATCH)
-            elif remote.status == "captured":
-                settlement = self._record_success(
-                    conn,
-                    payment,
-                    amount_paise=remote.amount_paise,
-                    currency=remote.currency,
-                    provider_payment_id=remote.payment_id,
-                    method=remote.method,
-                    actor_id=actor_id,
-                    paid_at=datetime.now(UTC),
-                )
-            elif remote.status == "authorized":
-                settlement = self._record_pending(conn, payment, remote.payment_id)
-            elif remote.status == "failed":
-                settlement = self._record_failure(
-                    conn, payment, remote.error_reason or "PAYMENT_FAILED", remote.payment_id
-                )
-            else:
-                settlement = Settlement(payment, None, Outcome.IGNORED)
-        self._generate_receipt_pdf(settlement)
-        return settlement
+        if row is None:
+            raise NotFoundError("student", target)
 
-    def _record_success(
+        assert_student_self_or_staff(
+            actor,
+            student_uuid=UUID(str(row["id"])),
+            student_id_code=row.get("student_id"),
+        )
+        return dict(row)
+
+    def create_order(
         self,
-        conn: DbConnection,
-        payment: Row,
+        actor: CurrentUser,
         *,
-        amount_paise: int,
-        currency: str,
-        provider_payment_id: str | None,
-        method: str | None,
-        actor_id: UUID | None,
-        paid_at: datetime,
-    ) -> Settlement:
-        """Apply a confirmed payment. The caller holds the payment row lock."""
-        receipts = ReceiptRepository(conn)
-        if payment["status"] == PaymentStatus.SUCCESS:
-            return Settlement(
-                payment, receipts.get_by_payment(payment["id"]), Outcome.ALREADY_PROCESSED
-            )
-        if payment["status"] == PaymentStatus.REFUNDED:
-            return Settlement(payment, receipts.get_by_payment(payment["id"]), Outcome.IGNORED)
-        if amount_paise != payment["amount_paise"] or currency != payment["currency"]:
-            flagged = self._flag_review(
-                conn,
-                payment,
-                f"AMOUNT_MISMATCH: expected {payment['amount_paise']} {payment['currency']}, "
-                f"received {amount_paise} {currency}",
-                provider_payment_id=provider_payment_id,
-            )
-            return Settlement(flagged, None, Outcome.AMOUNT_MISMATCH)
+        month_year: str | None = None,
+        student_id: str | UUID | None = None,
+    ) -> dict[str, Any]:
+        """Initialize a Razorpay order using the server-side `monthly_fee` from `students`."""
+        target_month = _validate_month_year(month_year)
+        student = self._resolve_student(actor, student_id)
+        student_uuid_str = str(student["id"])
+        student_code: str = student.get("student_id") or student_uuid_str[:8].upper()
+        course: str = student.get("course") or student.get("batch") or "GENERAL"
 
-        ensure_transition(PaymentStatus(payment["status"]), PaymentStatus.SUCCESS)
-        payments = PaymentRepository(conn)
-        updated = payments.update_fields(
-            payment["id"],
+        monthly_fee = Decimal(str(student.get("monthly_fee", 600))).quantize(
+            Decimal("0.01")
+        )
+        if monthly_fee <= Decimal("0.00"):
+            monthly_fee = Decimal("600.00")
+        amount_paise = int(monthly_fee * 100)
+
+        existing = self._db["fee_payments"].find_one(
             {
-                "status": PaymentStatus.SUCCESS,
-                "provider_payment_id": provider_payment_id,
-                "method": method or payment["method"],
-                "paid_at": paid_at,
-                "failure_reason": None,
-            },
-        )
-        assert updated is not None
-
-        fees = FeeRepository(conn)
-        fee = fees.get_by_id(payment["fee_id"], for_update=True)
-        assert fee is not None
-        new_paid = fee["paid_paise"] + payment["amount_paise"]
-        updated_fee = fees.update_fields(
-            fee["id"],
-            {
-                "paid_paise": new_paid,
-                "status": compute_fee_status(
-                    amount_paise=fee["amount_paise"],
-                    concession_paise=fee["concession_paise"],
-                    paid_paise=new_paid,
-                    due_date=fee["due_date"],
-                    today=local_today(self.timezone),
-                    current=FeeStatus(fee["status"]),
-                ),
-            },
-        )
-        assert updated_fee is not None
-
-        # Keep student_monthly_fees in sync when monthly fees are paid
-        if updated_fee["status"] in (FeeStatus.PAID, "PAID"):
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    update student_monthly_fees
-                    set status = 'PAID', paid_on = coalesce(paid_on, %s), amount_paise = coalesce(amount_paise, %s)
-                    where student_id = %s and period = %s
-                    """,
-                    (local_today(self.timezone), payment["amount_paise"], fee["student_id"], fee["due_date"]),
-                )
-
-        review_reason = None
-        if fee["status"] == FeeStatus.CANCELLED:
-            review_reason = "FEE_CANCELLED: payment received for a cancelled fee"
-        elif outstanding(fee["amount_paise"], fee["concession_paise"], new_paid) < 0:
-            review_reason = "OVERPAYMENT: payment exceeds the outstanding balance"
-        if review_reason:
-            logger.warning(
-                "payment flagged for review",
-                extra={"payment_id": str(payment["id"]), "reason": review_reason},
-            )
-            updated = payments.update_fields(
-                payment["id"], {"requires_review": True, "review_reason": review_reason}
-            )
-            assert updated is not None
-
-        receipt = self.receipts.create_record(conn, updated)
-        self.notifications.enqueue_payment_success(
-            conn, payment=updated, fee=updated_fee, receipt=receipt
-        )
-        record_audit(
-            conn,
-            actor_id=actor_id,
-            action="payment.succeeded",
-            entity_type="payment",
-            entity_id=payment["id"],
-            before=payment,
-            after=updated,
-        )
-        return Settlement(updated, receipt, Outcome.SUCCEEDED)
-
-    @staticmethod
-    def _record_pending(conn: DbConnection, payment: Row, provider_payment_id: str) -> Settlement:
-        status = PaymentStatus(payment["status"])
-        if status == PaymentStatus.SUCCESS:
-            return Settlement(payment, None, Outcome.ALREADY_PROCESSED)
-        if not can_transition(status, PaymentStatus.PENDING):
-            return Settlement(payment, None, Outcome.PENDING)
-        updated = PaymentRepository(conn).update_fields(
-            payment["id"],
-            {"status": PaymentStatus.PENDING, "provider_payment_id": provider_payment_id},
-        )
-        assert updated is not None
-        return Settlement(updated, None, Outcome.PENDING)
-
-    @staticmethod
-    def _record_failure(
-        conn: DbConnection, payment: Row, reason: str, provider_payment_id: str
-    ) -> Settlement:
-        status = PaymentStatus(payment["status"])
-        if status in (PaymentStatus.SUCCESS, PaymentStatus.REFUNDED):
-            # A late failure for an earlier attempt never undoes a successful payment.
-            return Settlement(payment, None, Outcome.IGNORED)
-        updated = PaymentRepository(conn).update_fields(
-            payment["id"],
-            {
-                "status": PaymentStatus.FAILED,
-                "failure_reason": reason[:300],
-                "provider_payment_id": provider_payment_id,
-            },
-        )
-        assert updated is not None
-        return Settlement(updated, None, Outcome.FAILED)
-
-    def _apply_refund(self, refund: ProviderRefund) -> Outcome:
-        with self.db.transaction() as conn:
-            payments = PaymentRepository(conn)
-            found = payments.get_by_provider_payment_id(refund.payment_id)
-            if found is None:
-                return Outcome.IGNORED
-            payment = payments.get_by_id(found["id"], for_update=True)
-            assert payment is not None
-            if payment["status"] == PaymentStatus.REFUNDED:
-                return Outcome.ALREADY_PROCESSED
-            if payment["status"] != PaymentStatus.SUCCESS:
-                return Outcome.IGNORED
-            if refund.amount_paise != payment["amount_paise"]:
-                self._flag_review(
-                    conn,
-                    payment,
-                    f"PARTIAL_REFUND: {refund.amount_paise} of {payment['amount_paise']} refunded",
-                )
-                return Outcome.REVIEW_REQUIRED
-            ensure_transition(PaymentStatus.SUCCESS, PaymentStatus.REFUNDED)
-            updated = payments.update_fields(payment["id"], {"status": PaymentStatus.REFUNDED})
-            fees = FeeRepository(conn)
-            fee = fees.get_by_id(payment["fee_id"], for_update=True)
-            assert fee is not None
-            new_paid = max(fee["paid_paise"] - payment["amount_paise"], 0)
-            fees.update_fields(
-                fee["id"],
-                {
-                    "paid_paise": new_paid,
-                    "status": compute_fee_status(
-                        amount_paise=fee["amount_paise"],
-                        concession_paise=fee["concession_paise"],
-                        paid_paise=new_paid,
-                        due_date=fee["due_date"],
-                        today=local_today(self.timezone),
-                        current=FeeStatus(fee["status"]),
+                "$or": [
+                    {"student_key": student_uuid_str, "month_year": target_month},
+                    *(
+                        [{"student_id": student_code, "month_year": target_month}]
+                        if student.get("student_id")
+                        else []
                     ),
+                ]
+            }
+        )
+        if existing and existing.get("status") == "PAID":
+            raise ConflictError(
+                f"Monthly fee for {format_month_label(target_month)} is already marked as PAID."
+            )
+
+        receipt_ref = (
+            f"bw_{re.sub(r'[^A-Za-z0-9]', '', student_code)[:16]}_{target_month}"
+        )
+        gw_order = self._gateway.create_order(
+            amount_paise=amount_paise,
+            currency=CURRENCY,
+            receipt=receipt_ref,
+            notes={
+                "student_key": student_uuid_str,
+                "student_id": student_code,
+                "student_name": student["name"],
+                "course": course,
+                "month_year": target_month,
+            },
+        )
+
+        row = self._db["fee_payments"].find_one_and_update(
+            {"student_key": student_uuid_str, "month_year": target_month},
+            {
+                "$set": {
+                    "student_key": student_uuid_str,
+                    "student_id": student.get("student_id") or "",
+                    "amount": float(monthly_fee),
+                    "razorpay_order_id": gw_order.id,
+                    "status": "PENDING",
+                },
+                "$setOnInsert": {
+                    "id": str(uuid4()),
+                    "month_year": target_month,
+                    "razorpay_payment_id": None,
+                    "payment_date": None,
+                },
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+
+        return {
+            "payment_id": str(row["id"]),
+            "order_id": gw_order.id,
+            "razorpay_order_id": gw_order.id,
+            "key_id": self._gateway.public_key_id,
+            "amount": float(monthly_fee),
+            "amount_paise": amount_paise,
+            "currency": CURRENCY,
+            "student_id": student_code,
+            "student_name": student["name"],
+            "student_email": None,
+            "student_phone": student.get("contact_number") or "",
+            "course": course,
+            "batch": course,
+            "month": target_month,
+            "month_year": target_month,
+            "month_label": format_month_label(target_month),
+            "fee_description": f"Brightway Monthly Fee - {format_month_label(target_month)}",
+        }
+
+    def verify_checkout(
+        self,
+        actor: CurrentUser,
+        *,
+        razorpay_order_id: str,
+        razorpay_payment_id: str,
+        razorpay_signature: str,
+    ) -> dict[str, Any]:
+        """Cryptographically verify Razorpay signature and mark `fee_payments` as PAID."""
+        payment_row = self._db["fee_payments"].find_one(
+            {"razorpay_order_id": razorpay_order_id}
+        )
+        if not payment_row:
+            raise NotFoundError("fee_payment_order", razorpay_order_id)
+
+        student = None
+        if payment_row.get("student_key"):
+            student = self._db["students"].find_one(
+                {"id": payment_row["student_key"]}
+            )
+        if not student and payment_row.get("student_id"):
+            student = self._db["students"].find_one(
+                {"student_id": payment_row["student_id"]}
+            )
+        if not student:
+            raise NotFoundError(
+                "student", payment_row.get("student_id") or payment_row.get("student_key")
+            )
+
+        assert_student_self_or_staff(
+            actor,
+            student_uuid=UUID(str(student["id"])),
+            student_id_code=student.get("student_id"),
+        )
+
+        self._gateway.verify_checkout_signature(
+            order_id=razorpay_order_id,
+            payment_id=razorpay_payment_id,
+            signature=razorpay_signature,
+        )
+
+        course = student.get("course") or student.get("batch") or "GENERAL"
+        if payment_row.get("status") == "PAID":
+            return _format_payment_row(
+                dict(payment_row),
+                student_name=student["name"],
+                course=course,
+            )
+
+        now = datetime.now(tz=UTC)
+        updated = self._db["fee_payments"].find_one_and_update(
+            {"id": str(payment_row["id"])},
+            {
+                "$set": {
+                    "status": "PAID",
+                    "razorpay_payment_id": razorpay_payment_id,
+                    "payment_date": now,
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+
+        return _format_payment_row(
+            dict(updated),
+            student_name=student["name"],
+            course=course,
+        )
+
+    def handle_webhook(self, *, raw_body: bytes, signature: str) -> dict[str, Any]:
+        self._gateway.verify_webhook_signature(raw_body=raw_body, signature=signature)
+        try:
+            event = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PaymentVerificationError("Webhook body is not valid JSON.") from exc
+
+        event_type = str(event.get("event") or "unknown")
+        payload_obj = event.get("payload") or {}
+        payment_entity = (payload_obj.get("payment") or {}).get("entity") or {}
+        order_entity = (payload_obj.get("order") or {}).get("entity") or {}
+
+        order_id = payment_entity.get("order_id") or order_entity.get("id")
+        rp_payment_id = payment_entity.get("id")
+
+        if not order_id:
+            return {"status": "ignored", "reason": "no_order_id", "event": event_type}
+
+        payment_row = self._db["fee_payments"].find_one(
+            {"razorpay_order_id": order_id}
+        )
+        if not payment_row:
+            return {
+                "status": "ignored",
+                "reason": "unknown_order",
+                "order_id": order_id,
+            }
+
+        if event_type in ("payment.captured", "order.paid"):
+            if payment_row.get("status") == "PAID":
+                return {
+                    "status": "duplicate",
+                    "payment_id": str(payment_row["id"]),
+                    "student_id": payment_row.get("student_id"),
+                }
+            self._db["fee_payments"].update_one(
+                {"id": str(payment_row["id"])},
+                {
+                    "$set": {
+                        "status": "PAID",
+                        "razorpay_payment_id": rp_payment_id
+                        or payment_row.get("razorpay_payment_id"),
+                        "payment_date": datetime.now(tz=UTC),
+                    }
                 },
             )
-            record_audit(
-                conn,
-                actor_id=None,
-                action="payment.refunded",
-                entity_type="payment",
-                entity_id=payment["id"],
-                before=payment,
-                after=updated,
+            return {
+                "status": "captured",
+                "payment_id": str(payment_row["id"]),
+                "student_id": payment_row.get("student_id"),
+            }
+
+        if event_type == "payment.failed" and payment_row.get("status") != "PAID":
+            self._db["fee_payments"].update_one(
+                {"id": str(payment_row["id"])},
+                {
+                    "$set": {
+                        "status": "FAILED",
+                        "razorpay_payment_id": rp_payment_id
+                        or payment_row.get("razorpay_payment_id"),
+                    }
+                },
             )
-        return Outcome.REFUNDED
+            return {"status": "failed", "payment_id": str(payment_row["id"])}
 
-    @staticmethod
-    def _flag_review(
-        conn: DbConnection, payment: Row, reason: str, *, provider_payment_id: str | None = None
-    ) -> Row:
-        logger.warning(
-            "payment flagged for review", extra={"payment_id": str(payment["id"]), "reason": reason}
-        )
-        changes: dict[str, object] = {"requires_review": True, "review_reason": reason[:300]}
-        if payment["status"] in (PaymentStatus.CREATED, PaymentStatus.FAILED):
-            changes["status"] = PaymentStatus.PENDING  # money may have moved; never mark SUCCESS
-        if provider_payment_id and not payment["provider_payment_id"]:
-            changes["provider_payment_id"] = provider_payment_id
-        updated = PaymentRepository(conn).update_fields(payment["id"], changes)
-        assert updated is not None
-        record_audit(
-            conn,
-            actor_id=None,
-            action="payment.flagged_for_review",
-            entity_type="payment",
-            entity_id=payment["id"],
-            before=payment,
-            after=updated,
-        )
-        return updated
+        return {"status": "recorded", "event": event_type}
 
-    # ------------------------------------------------------------------ helpers
-    def _payable_amount(self, fee: Row, requested: int | None) -> int:
-        if fee["status"] == FeeStatus.CANCELLED:
-            raise InvalidStateError("This fee has been cancelled.", code="FEE_CANCELLED")
-        balance = outstanding(fee["amount_paise"], fee["concession_paise"], fee["paid_paise"])
-        if balance <= 0:
-            raise InvalidStateError("This fee is already paid.", code="FEE_ALREADY_PAID")
-        amount = requested or balance
-        if amount > balance:
-            raise ValidationFailedError(
-                "The amount exceeds the outstanding balance.",
-                code="AMOUNT_EXCEEDS_BALANCE",
-                details={"balance_paise": balance},
+    def record_admin_payment(
+        self,
+        actor: CurrentUser,
+        *,
+        student_id: str,
+        month_year: str | None = None,
+        status: str = "PAID",
+        amount: float | Decimal | None = None,
+        reference: str | None = None,
+    ) -> dict[str, Any]:
+        """Allow SUPER_ADMIN to record or toggle a fee payment status (PAID / UNPAID) in `fee_payments`."""
+        target_month = _validate_month_year(month_year)
+        student = self._resolve_student(actor, student_id)
+        student_uuid_str = str(student["id"])
+        student_code = student.get("student_id") or ""
+        course = student.get("course") or student.get("batch") or "GENERAL"
+        norm_status = status.strip().upper()
+
+        if norm_status == "UNPAID":
+            self._db["fee_payments"].delete_many(
+                {
+                    "$or": [
+                        {"student_key": student_uuid_str, "month_year": target_month},
+                        *(
+                            [{"student_id": student_code, "month_year": target_month}]
+                            if student_code
+                            else []
+                        ),
+                    ]
+                }
             )
-        return amount
+            return {
+                "id": student_uuid_str,
+                "student_key": student_uuid_str,
+                "student_id": student_code,
+                "student_name": student["name"],
+                "course": course,
+                "batch": course,
+                "month": target_month,
+                "month_year": target_month,
+                "month_label": format_month_label(target_month),
+                "status": "UNPAID",
+                "amount": float(student.get("monthly_fee", 600)),
+            }
 
-    def _checkout(self, conn: DbConnection, payment: Row, fee: Row) -> CheckoutOrder:
-        student = StudentRepository(conn).get_by_id(payment["student_id"])
-        assert student is not None
-        return CheckoutOrder(
-            payment_id=payment["id"],
-            provider=payment["provider"],
-            provider_order_id=payment["provider_order_id"],
-            amount_paise=payment["amount_paise"],
-            currency=payment["currency"],
-            key_id=self.provider.checkout_key,
-            fee_title=fee["title"],
+        if norm_status not in ("PAID", "PENDING", "FAILED"):
+            raise ValidationError("Status must be PAID, PENDING, FAILED, or UNPAID.")
+
+        fee_amt = float(
+            Decimal(str(amount)).quantize(Decimal("0.01"))
+            if amount is not None
+            else Decimal(str(student.get("monthly_fee", 600))).quantize(
+                Decimal("0.01")
+            )
+        )
+        pay_ref = reference or f"ADMIN-{target_month}"
+        now = datetime.now(tz=UTC) if norm_status == "PAID" else None
+
+        row = self._db["fee_payments"].find_one_and_update(
+            {"student_key": student_uuid_str, "month_year": target_month},
+            {
+                "$set": {
+                    "student_key": student_uuid_str,
+                    "student_id": student_code,
+                    "amount": fee_amt,
+                    "status": norm_status,
+                    "razorpay_payment_id": pay_ref,
+                    "payment_date": now,
+                },
+                "$setOnInsert": {
+                    "id": str(uuid4()),
+                    "month_year": target_month,
+                    "razorpay_order_id": None,
+                },
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return _format_payment_row(
+            dict(row), student_name=student["name"], course=course
+        )
+
+    def get_payment(self, actor: CurrentUser, payment_id: UUID) -> dict[str, Any]:
+        row = self._db["fee_payments"].find_one({"id": str(payment_id)})
+        if not row:
+            raise NotFoundError("fee_payment", payment_id)
+
+        student = None
+        if row.get("student_key"):
+            student = self._db["students"].find_one({"id": row["student_key"]})
+        if not student and row.get("student_id"):
+            student = self._db["students"].find_one({"student_id": row["student_id"]})
+        if not student:
+            raise NotFoundError("student", row.get("student_id") or row.get("student_key"))
+
+        assert_student_self_or_staff(
+            actor,
+            student_uuid=UUID(str(student["id"])),
+            student_id_code=student.get("student_id"),
+        )
+        return _format_payment_row(
+            dict(row),
             student_name=student["name"],
-            contact=student["contact_e164"],
+            course=student.get("course") or student.get("batch"),
         )
 
-    def _replay_order(
-        self, conn: DbConnection, existing: Row, fee: Row, payload: CreateOrderRequest
-    ) -> CheckoutOrder:
-        if existing["fee_id"] != fee["id"] or (
-            payload.amount_paise is not None and payload.amount_paise != existing["amount_paise"]
-        ):
-            raise _idempotency_conflict()
-        if existing["provider_order_id"] is None or existing["status"] != PaymentStatus.CREATED:
-            raise ConflictError(
-                "This payment request is no longer open. Use a new idempotency key.",
-                code="PAYMENT_NOT_OPEN",
-            )
-        return self._checkout(conn, existing, fee)
+    def list_payments(
+        self,
+        actor: CurrentUser,
+        params: PageParams,
+        *,
+        student_id: str | UUID | None = None,
+        status: str | None = None,
+        month_year: str | None = None,
+    ) -> Page[dict[str, Any]]:
+        mongo_filter: dict[str, Any] = {}
 
-    def _generate_receipt_pdf(self, settlement: Settlement) -> None:
-        if settlement.outcome != Outcome.SUCCEEDED or settlement.receipt is None:
-            return
-        try:
-            detail = self.receipts.ensure_pdf(settlement.receipt["id"])
-            settlement.receipt = {**settlement.receipt, "pdf_path": detail["pdf_path"]}
-        except AppError as exc:
-            # The receipt record exists; the PDF is regenerated on the next download.
-            logger.warning(
-                "receipt pdf generation deferred",
-                extra={"receipt_id": str(settlement.receipt["id"]), "code": exc.code},
-            )
+        if not actor.is_admin:
+            or_q: list[dict[str, Any]] = [{"student_key": str(actor.id)}]
+            if actor.student_id:
+                or_q.append({"student_id": actor.student_id})
+            mongo_filter["$or"] = or_q
+        elif student_id is not None:
+            student = self._resolve_student(actor, student_id)
+            or_q = [{"student_key": str(student["id"])}]
+            if student.get("student_id"):
+                or_q.append({"student_id": student["student_id"]})
+            mongo_filter["$or"] = or_q
 
-    @staticmethod
-    def _result(settlement: Settlement) -> PaymentResult:
-        if settlement.outcome in _VERIFICATION_FAILURES:
-            raise PaymentVerificationError(
-                "Payment details do not match the order. The payment has been flagged for review.",
-                code=settlement.outcome.value,
-            )
-        return PaymentResult(
-            payment=Payment.model_validate(settlement.payment),
-            receipt=Receipt.model_validate(settlement.receipt) if settlement.receipt else None,
-            outcome=settlement.outcome.value,
+        if status and status.strip().upper() != "ALL":
+            mongo_filter["status"] = status.strip().upper()
+
+        if month_year and month_year.strip():
+            mongo_filter["month_year"] = month_year.strip()
+
+        total = self._db["fee_payments"].count_documents(mongo_filter)
+        rows = list(
+            self._db["fee_payments"]
+            .find(mongo_filter)
+            .sort([("payment_date", -1), ("month_year", -1)])
+            .skip(params.offset)
+            .limit(params.limit)
         )
 
-    @staticmethod
-    def _ensure_access(user: CurrentUser, payment: Row) -> None:
-        if user.is_admin or (user.is_student and payment["student_id"] == user.student_id):
-            return
-        raise ForbiddenError("You do not have access to this payment.")
+        student_keys = list({r["student_key"] for r in rows if r.get("student_key")})
+        student_codes = list({r["student_id"] for r in rows if r.get("student_id")})
+        student_map_by_key: dict[str, dict[str, Any]] = {}
+        student_map_by_code: dict[str, dict[str, Any]] = {}
+        if student_keys or student_codes:
+            or_s: list[dict[str, Any]] = []
+            if student_keys:
+                or_s.append({"id": {"$in": student_keys}})
+            if student_codes:
+                or_s.append({"student_id": {"$in": student_codes}})
+            for s in self._db["students"].find({"$or": or_s}):
+                student_map_by_key[str(s["id"])] = s
+                if s.get("student_id"):
+                    student_map_by_code[s["student_id"]] = s
 
+        items = []
+        for r in rows:
+            s_doc = student_map_by_key.get(r.get("student_key", "")) or student_map_by_code.get(
+                r.get("student_id", ""), {}
+            )
+            items.append(
+                _format_payment_row(
+                    dict(r),
+                    student_name=s_doc.get("name"),
+                    course=s_doc.get("course") or s_doc.get("batch"),
+                )
+            )
+        return Page.of(items, total, params)
 
-def _idempotency_conflict() -> ConflictError:
-    return ConflictError(
-        "This idempotency key was already used for a different request.",
-        code="IDEMPOTENCY_KEY_REUSED",
-    )
+    def render_receipt_pdf(
+        self, actor: CurrentUser, payment_id: UUID
+    ) -> tuple[bytes, str]:
+        row = self._db["fee_payments"].find_one({"id": str(payment_id)})
+        if not row:
+            raise NotFoundError("fee_payment", payment_id)
+
+        student = None
+        if row.get("student_key"):
+            student = self._db["students"].find_one({"id": row["student_key"]})
+        if not student and row.get("student_id"):
+            student = self._db["students"].find_one({"student_id": row["student_id"]})
+        if not student:
+            raise NotFoundError("student", row.get("student_id") or row.get("student_key"))
+
+        assert_student_self_or_staff(
+            actor,
+            student_uuid=UUID(str(student["id"])),
+            student_id_code=student.get("student_id"),
+        )
+
+        course = student.get("course") or student.get("batch") or "GENERAL"
+        code = student.get("student_id") or str(student["id"])[:8].upper()
+        m_yr = row.get("month_year") or get_active_month()
+
+        pdf = FPDF(orientation="P", unit="mm", format="A5")
+        pdf.add_page()
+        pdf.set_fill_color(30, 58, 138)
+        pdf.rect(0, 0, 148, 28, style="F")
+        pdf.set_fill_color(245, 158, 11)
+        pdf.rect(0, 28, 148, 2, style="F")
+
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_xy(10, 8)
+        pdf.cell(128, 7, "BRIGHTWAY COMPUTER ACADEMY", align="L")
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(251, 191, 36)
+        pdf.set_xy(10, 16)
+        pdf.cell(128, 6, "OFFICIAL FEE PAYMENT RECEIPT", align="L")
+
+        pdf.set_text_color(15, 23, 42)
+        y = 38
+        p_date = row.get("payment_date")
+        details = [
+            ("Receipt ID", f"BW-RCP-{str(row['id'])[:8].upper()}"),
+            ("Student Name", str(student["name"])),
+            ("Student ID", code),
+            ("Course", str(course)),
+            ("Contact Number", str(student.get("contact_number") or "-")),
+            ("Fee Month", f"{format_month_label(m_yr)} ({m_yr})"),
+            ("Amount Paid", f"INR {Decimal(str(row['amount'])):.2f}"),
+            ("Payment Status", str(row["status"])),
+            (
+                "Payment Reference",
+                str(row.get("razorpay_payment_id") or "ADMIN-RECORDED"),
+            ),
+            (
+                "Payment Date",
+                p_date.strftime("%d %b %Y, %I:%M %p")
+                if isinstance(p_date, datetime)
+                else str(p_date or "-"),
+            ),
+        ]
+        for label, value in details:
+            pdf.set_xy(12, y)
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_text_color(100, 116, 139)
+            pdf.cell(48, 7, label)
+            pdf.set_font("Helvetica", "B", 9.5)
+            pdf.set_text_color(15, 23, 42)
+            pdf.cell(76, 7, value.encode("latin-1", "replace").decode("latin-1"))
+            y += 8.5
+
+        filename = f"Brightway-Receipt-{code}-{m_yr}.pdf"
+        return bytes(pdf.output()), filename

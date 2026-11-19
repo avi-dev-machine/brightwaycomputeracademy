@@ -1,145 +1,137 @@
-from typing import Annotated
-from uuid import UUID
+"""Clean, unified Admin Portal API router (`/api/v1/admin`).
 
-from fastapi import APIRouter, Query, status
+Provides a single logical namespace for all administrator operations:
+- `GET /api/v1/admin/dashboard`
+- `GET /api/v1/admin/students`
+- `POST /api/v1/admin/students`
+- `PUT / PATCH /api/v1/admin/students/{student_id}`
+- `DELETE /api/v1/admin/students/{student_id}`
+- `POST /api/v1/admin/students/{student_id}/fee-status`
+"""
 
-from app.core.constants import Role
+from typing import Any
+
+from fastapi import APIRouter, status
+from pydantic import BaseModel, Field
+
+from app.api.v1.students import StudentWritePayload
+from app.core.constants import get_active_month
 from app.dependencies import (
-    AdminUser,
+    AdminDep,
     ContainerDep,
-    audit_service,
-    auth_service,
-    notification_service,
-    settings_service,
+    payment_service,
+    report_service,
+    student_service,
 )
-from app.models.audit import AuditLog
-from app.models.settings import AcademySettings, FeeSettings, NotificationSettings, SettingKey
-from app.models.user import UserProfile
-from app.schemas.admin import AllSettings, SetupStatus, SystemStatus
-from app.schemas.auth import InviteUserRequest, LinkUserRequest, UpdateUserRequest
 from app.schemas.common import ApiResponse, ok
-from app.utils.pagination import PageDep, paged
+from app.utils.pagination import Page, PageDep
 
 router = APIRouter()
 
 
-# ---------------------------------------------------------------------- first-run setup
-@router.get("/setup", response_model=ApiResponse[SetupStatus])
-def setup_status(user: AdminUser, container: ContainerDep) -> ApiResponse[SetupStatus]:
-    channels = notification_service(container).available_channels
-    return ok(settings_service(container).setup_status(channels))
+class FeeStatusTogglePayload(BaseModel):
+    status: str = Field(default="PAID", pattern=r"^(PAID|UNPAID)$")
+    month: str | None = Field(default=None)
+    amount: float | None = Field(default=None, ge=0)
 
 
-@router.post("/setup/complete", response_model=ApiResponse[SetupStatus])
-def complete_setup(user: AdminUser, container: ContainerDep) -> ApiResponse[SetupStatus]:
-    channels = notification_service(container).available_channels
-    return ok(settings_service(container).complete_setup(user, channels))
-
-
-@router.get("/settings", response_model=ApiResponse[AllSettings])
-def get_settings(user: AdminUser, container: ContainerDep) -> ApiResponse[AllSettings]:
-    return ok(settings_service(container).all())
-
-
-@router.put("/settings/academy", response_model=ApiResponse[AcademySettings])
-def update_academy_settings(
-    payload: AcademySettings, user: AdminUser, container: ContainerDep
-) -> ApiResponse[AcademySettings]:
-    return ok(settings_service(container).update(user, SettingKey.ACADEMY, payload))
-
-
-@router.put("/settings/fees", response_model=ApiResponse[FeeSettings])
-def update_fee_settings(
-    payload: FeeSettings, user: AdminUser, container: ContainerDep
-) -> ApiResponse[FeeSettings]:
-    return ok(settings_service(container).update(user, SettingKey.FEES, payload))
-
-
-@router.put("/settings/notifications", response_model=ApiResponse[NotificationSettings])
-def update_notification_settings(
-    payload: NotificationSettings, user: AdminUser, container: ContainerDep
-) -> ApiResponse[NotificationSettings]:
-    return ok(settings_service(container).update(user, SettingKey.NOTIFICATIONS, payload))
-
-
-@router.get("/system/status", response_model=ApiResponse[SystemStatus])
-def system_status(user: AdminUser, container: ContainerDep) -> ApiResponse[SystemStatus]:
-    s = container.settings
+@router.get("/dashboard", response_model=ApiResponse[dict[str, Any]])
+def admin_dashboard(
+    _user: AdminDep,
+    container: ContainerDep,
+    month: str | None = None,
+    month_year: str | None = None,
+    course: str | None = None,
+    batch: str | None = None,
+) -> ApiResponse[dict[str, Any]]:
+    resolved_month = get_active_month(month or month_year)
     return ok(
-        SystemStatus(
-            app_env=s.app_env,
-            payment_provider=container.payment_provider.name,
-            razorpay_webhook_configured=bool(s.razorpay_webhook_secret.get_secret_value()),
-            storage_backend=container.storage.backend_name,
-            supabase_admin_configured=container.auth_client.admin_configured,
-            notification_channels=notification_service(container).available_channels,
-            notification_providers={
-                channel.value: provider.name
-                for channel, provider in container.notification_providers.items()
-            },
-            whatsapp_provider=s.whatsapp_provider,
-            whatsapp_configured=s.whatsapp_configured,
-            sms_configured=s.sms_configured,
+        report_service(container).dashboard(
+            month_year=resolved_month,
+            batch=course or batch,
         )
     )
 
 
-# ---------------------------------------------------------------------- accounts
-@router.get("/users", response_model=ApiResponse[list[UserProfile]])
-def list_users(
-    user: AdminUser,
+@router.get("/students", response_model=ApiResponse[Page[dict[str, Any]]])
+def admin_list_students(
+    page: PageDep,
+    _user: AdminDep,
     container: ContainerDep,
-    params: PageDep,
-    role: Role | None = None,
-    active: bool | None = None,
-) -> ApiResponse[list[UserProfile]]:
-    return paged(auth_service(container).list_users(role=role, active=active, params=params))
+    search: str | None = None,
+    course: str | None = None,
+    batch: str | None = None,
+    fee_status: str | None = None,
+    id_status: str | None = None,
+    month: str | None = None,
+    month_year: str | None = None,
+) -> ApiResponse[Page[dict[str, Any]]]:
+    resolved_month = get_active_month(month or month_year)
+    return ok(
+        student_service(container).list(
+            page,
+            search=search,
+            course=course or batch,
+            fee_status=fee_status,
+            id_status=id_status,
+            month_year=resolved_month,
+        )
+    )
 
 
 @router.post(
-    "/users/link", response_model=ApiResponse[UserProfile], status_code=status.HTTP_201_CREATED
+    "/students",
+    response_model=ApiResponse[dict[str, Any]],
+    status_code=status.HTTP_201_CREATED,
 )
-def link_user(
-    payload: LinkUserRequest, user: AdminUser, container: ContainerDep
-) -> ApiResponse[UserProfile]:
-    """Give an existing Supabase Auth user (by id or email) a role in the application."""
-    return ok(auth_service(container).link_user(user, payload))
+def admin_create_student(
+    payload: StudentWritePayload,
+    _user: AdminDep,
+    container: ContainerDep,
+) -> ApiResponse[dict[str, Any]]:
+    return ok(student_service(container).create(payload.model_dump(exclude_none=True)))
+
+
+@router.put("/students/{student_id}", response_model=ApiResponse[dict[str, Any]])
+@router.patch("/students/{student_id}", response_model=ApiResponse[dict[str, Any]])
+def admin_update_student(
+    student_id: str,
+    payload: StudentWritePayload,
+    _user: AdminDep,
+    container: ContainerDep,
+) -> ApiResponse[dict[str, Any]]:
+    return ok(
+        student_service(container).update(
+            student_id, payload.model_dump(exclude_unset=True)
+        )
+    )
+
+
+@router.delete("/students/{student_id}", response_model=ApiResponse[dict[str, Any]])
+def admin_delete_student(
+    student_id: str,
+    _user: AdminDep,
+    container: ContainerDep,
+) -> ApiResponse[dict[str, Any]]:
+    return ok(student_service(container).delete(student_id))
 
 
 @router.post(
-    "/users/invite", response_model=ApiResponse[UserProfile], status_code=status.HTTP_201_CREATED
+    "/students/{student_id}/fee-status", response_model=ApiResponse[dict[str, Any]]
 )
-def invite_user(
-    payload: InviteUserRequest, user: AdminUser, container: ContainerDep
-) -> ApiResponse[UserProfile]:
-    """Create a Supabase Auth user, email them an invite and link the role (needs service key)."""
-    return ok(auth_service(container).invite_user(user, payload))
-
-
-@router.patch("/users/{user_id}", response_model=ApiResponse[UserProfile])
-def update_user(
-    user_id: UUID, payload: UpdateUserRequest, user: AdminUser, container: ContainerDep
-) -> ApiResponse[UserProfile]:
-    return ok(auth_service(container).update_user(user, user_id, payload))
-
-
-# ---------------------------------------------------------------------- audit trail
-@router.get("/audit-logs", response_model=ApiResponse[list[AuditLog]])
-def list_audit_logs(
-    user: AdminUser,
+def admin_set_fee_status(
+    student_id: str,
+    payload: FeeStatusTogglePayload,
+    user: AdminDep,
     container: ContainerDep,
-    params: PageDep,
-    entity_type: Annotated[str | None, Query(max_length=50)] = None,
-    entity_id: Annotated[str | None, Query(max_length=100)] = None,
-    actor_user_id: UUID | None = None,
-    action: Annotated[str | None, Query(max_length=100)] = None,
-) -> ApiResponse[list[AuditLog]]:
-    return paged(
-        audit_service(container).search(
-            entity_type=entity_type,
-            entity_id=entity_id,
-            actor_user_id=actor_user_id,
-            action=action,
-            params=params,
+) -> ApiResponse[dict[str, Any]]:
+    resolved_month = get_active_month(payload.month)
+    return ok(
+        payment_service(container).record_admin_payment(
+            user,
+            student_id=student_id,
+            month_year=resolved_month,
+            status=payload.status,
+            amount=payload.amount,
         )
     )

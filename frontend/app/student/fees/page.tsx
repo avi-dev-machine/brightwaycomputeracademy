@@ -1,340 +1,270 @@
 "use client";
 
-import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { studentsApi } from "@/lib/api/students";
-import { feesApi } from "@/lib/api/fees";
-import { paymentsApi } from "@/lib/api/payments";
-import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Skeleton } from "@/components/ui/skeleton";
-import { EmptyState } from "@/components/ui/empty-state";
-import { RazorpayCheckoutModal } from "@/components/payments/razorpay-checkout";
-import { formatCurrency, formatDate, formatDateTime } from "@/lib/utils";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  CreditCard,
-  AlertCircle,
-  Clock,
   CheckCircle2,
-  Lock,
+  AlertCircle,
+  Calendar,
+  Download,
+  ShieldCheck,
 } from "lucide-react";
-import type { Fee } from "@/types/api";
+import { api } from "@/lib/api/client";
+import { RazorpayCheckoutButton } from "@/components/payments/razorpay-checkout";
+import { CardSkeleton } from "@/components/ui/skeleton";
+
+interface MonthlyLedgerItem {
+  month_year: string;
+  month_label: string;
+  month_short: string;
+  amount: number;
+  amount_paise: number;
+  status: "PAID" | "UNPAID" | "PENDING" | "FAILED";
+  is_current_month: boolean;
+  razorpay_order_id?: string | null;
+  razorpay_payment_id?: string | null;
+  payment_date?: string | null;
+}
+
+interface FeePaymentRecord {
+  id: string;
+  student_id: string;
+  amount: number;
+  month_year: string;
+  month_label?: string;
+  razorpay_order_id?: string | null;
+  razorpay_payment_id?: string | null;
+  status: string;
+  payment_date?: string | null;
+}
+
+interface StudentProfileData {
+  id: string;
+  student_id: string;
+  name: string;
+  contact_number: string;
+  course?: string;
+  batch: string;
+  monthly_fee: number;
+  fee_status?: "PAID" | "UNPAID";
+  current_month_status: "PAID" | "UNPAID";
+  month?: string;
+  current_month: string;
+  month_label?: string;
+  monthly_ledger: MonthlyLedgerItem[];
+  fee_payments: FeePaymentRecord[];
+}
 
 export default function StudentFeesPage() {
-  const [payingFee, setPayingFee] = useState<Fee | null>(null);
+  const queryClient = useQueryClient();
 
-  const { data: student } = useQuery({
-    queryKey: ["student-me"],
-    queryFn: () => studentsApi.me(),
+  const { data: student, isLoading } = useQuery<StudentProfileData>({
+    queryKey: ["student", "me"],
+    queryFn: () => api.get<StudentProfileData>("/v1/student/me"),
   });
 
-  const studentId = student?.id;
+  const refresh = () => {
+    queryClient.invalidateQueries({ queryKey: ["student", "me"] });
+  };
 
-  const { data: feeSummary, isLoading: summaryLoading } = useQuery({
-    queryKey: ["student-fee-summary", studentId],
-    queryFn: () => feesApi.summary(studentId!),
-    enabled: !!studentId,
-  });
+  if (isLoading || !student) {
+    return (
+      <div className="space-y-6">
+        <CardSkeleton />
+        <CardSkeleton />
+      </div>
+    );
+  }
 
-  const { data: feesData, isLoading: feesLoading } = useQuery({
-    queryKey: ["student-fees", studentId],
-    queryFn: () => feesApi.list({ student_id: studentId!, page_size: 50 }),
-    enabled: !!studentId,
-  });
-
-  const { data: paymentsData, isLoading: paymentsLoading } = useQuery({
-    queryKey: ["student-payments", studentId],
-    queryFn: () => paymentsApi.list({ student_id: studentId!, page_size: 50 }),
-    enabled: !!studentId,
-  });
-
-  const fees = feesData?.items || [];
-  const payments = paymentsData?.items || [];
+  const activeStatus =
+    student.fee_status || student.current_month_status || "UNPAID";
+  const isCurrentPaid = activeStatus === "PAID";
+  const activeMonth = student.month || student.current_month || "2027-12";
+  const activeMonthLabel = student.month_label || "December 2027";
+  const courseName = student.course || student.batch || "GENERAL";
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight text-slate-900">
-          Fee Dues & Online Payments
-        </h1>
-        <p className="text-xs text-slate-500 mt-0.5">
-          View tuition schedules, settle dues securely online via UPI/Card, and verify digital receipts.
-        </p>
-      </div>
+    <div className="space-y-8">
+      {/* Header & Current Month Status */}
+      <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs flex flex-col lg:flex-row lg:items-center justify-between gap-6">
+        <div>
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-blue-50 text-[#2563EB] px-3 py-1 text-xs font-extrabold uppercase tracking-wider">
+            <ShieldCheck className="h-3.5 w-3.5" />
+            Razorpay Secured Fee Portal • {activeMonthLabel}
+          </span>
+          <h1 className="mt-2 font-display text-2xl font-extrabold text-[#1E3A8A]">
+            Monthly Tuition Fee Ledger — {student.name} ({student.student_id})
+          </h1>
+          <p className="text-xs text-slate-600 mt-1">
+            Course: <strong>{courseName}</strong> • Monthly Tuition Fee:{" "}
+            <strong>₹{Number(student.monthly_fee).toFixed(2)}</strong>
+          </p>
+        </div>
 
-      {/* Current Month (October 2026) Status Banner */}
-      <Card
-        className={`p-4 border ${
-          student?.current_month_status === "PAID"
-            ? "border-emerald-200 bg-emerald-50/50"
-            : "border-rose-200 bg-rose-50/50"
-        }`}
-      >
-        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <div
-              className={`h-10 w-10 rounded-full flex items-center justify-center shrink-0 ${
-                student?.current_month_status === "PAID"
-                  ? "bg-emerald-100 text-emerald-700"
-                  : "bg-rose-100 text-rose-700"
-              }`}
-            >
-              {student?.current_month_status === "PAID" ? (
-                <CheckCircle2 className="h-5 w-5" />
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-4">
+          <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+            <p className="text-[11px] font-bold uppercase text-slate-500">
+              Active Month ({activeMonthLabel})
+            </p>
+            <div className="mt-1 flex items-center gap-2">
+              {isCurrentPaid ? (
+                <span className="inline-flex items-center gap-1 text-sm font-extrabold text-emerald-700">
+                  <CheckCircle2 className="h-4 w-4" />
+                  PAID
+                </span>
               ) : (
-                <AlertCircle className="h-5 w-5" />
+                <span className="inline-flex items-center gap-1 text-sm font-extrabold text-amber-700">
+                  <AlertCircle className="h-4 w-4 text-[#F59E0B]" />
+                  UNPAID (₹{Number(student.monthly_fee).toFixed(0)} Due)
+                </span>
               )}
             </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h3 className="font-bold text-sm text-slate-900">
-                  October 2026 Monthly Tuition:
-                </h3>
-                <Badge
-                  variant={
-                    student?.current_month_status === "PAID" ? "success" : "danger"
-                  }
-                >
-                  {student?.current_month_status === "PAID" ? "PAID" : "UNPAID / DUE"}
-                </Badge>
-              </div>
-              <p className="text-xs text-slate-600 mt-0.5">
-                {student?.current_month_status === "PAID"
-                  ? "Your October 2026 tuition is fully settled."
-                  : student?.due_months_count && student.due_months_count > 1
-                  ? `${student.due_months_count} total months currently due (${student.unpaid_months?.slice(0, 3).join(", ")}${student.unpaid_months && student.unpaid_months.length > 3 ? "..." : ""}). Settle recent to past below.`
-                  : "October 2026 tuition fee is due. Settle online below."}
-              </p>
-            </div>
           </div>
-          {student?.total_due_paise && student.total_due_paise > 0 ? (
-            <div className="text-right">
-              <span className="text-[11px] font-medium text-slate-500 block">Total Due Balance</span>
-              <span className="text-lg font-bold text-rose-700 font-mono">
-                {formatCurrency(student.total_due_paise)}
-              </span>
-            </div>
-          ) : null}
+
+          {!isCurrentPaid && (
+            <RazorpayCheckoutButton
+              monthYear={activeMonth}
+              monthLabel={`${activeMonthLabel} (${activeMonth})`}
+              monthlyFee={student.monthly_fee}
+              studentId={student.student_id}
+              studentName={student.name}
+              contactNumber={student.contact_number}
+              onSuccess={refresh}
+            />
+          )}
         </div>
-      </Card>
-
-      {/* Summary KPI Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <Card className="p-5">
-          <span className="text-xs font-medium text-slate-500">Total Program Fee</span>
-          {summaryLoading ? (
-            <Skeleton className="mt-2 h-7 w-24" />
-          ) : (
-            <p className="mt-2 text-2xl font-bold text-slate-900 tabular">
-              {formatCurrency(feeSummary?.total_amount_paise)}
-            </p>
-          )}
-          <p className="mt-1 text-[11px] text-slate-400">Scheduled course fee</p>
-        </Card>
-
-        <Card className="p-5">
-          <span className="text-xs font-medium text-slate-500">Total Paid</span>
-          {summaryLoading ? (
-            <Skeleton className="mt-2 h-7 w-24" />
-          ) : (
-            <p className="mt-2 text-2xl font-bold text-emerald-600 tabular">
-              {formatCurrency(feeSummary?.total_paid_paise)}
-            </p>
-          )}
-          <p className="mt-1 text-[11px] text-slate-400">Settled and receipted</p>
-        </Card>
-
-        <Card className="p-5 border-blue-200 bg-blue-50/30">
-          <span className="text-xs font-medium text-blue-900">Current Balance Due</span>
-          {summaryLoading ? (
-            <Skeleton className="mt-2 h-7 w-24" />
-          ) : (
-            <p className="mt-2 text-2xl font-bold text-blue-700 tabular">
-              {formatCurrency(feeSummary?.total_outstanding_paise)}
-            </p>
-          )}
-          {feeSummary && feeSummary.overdue_paise > 0 ? (
-            <p className="mt-1 text-[11px] font-medium text-rose-600">
-              Includes {formatCurrency(feeSummary.overdue_paise)} overdue
-            </p>
-          ) : (
-            <p className="mt-1 text-[11px] text-blue-600">All installments on track</p>
-          )}
-        </Card>
       </div>
 
-      {/* Scheduled Fee Items & Pay Now Actions */}
-      <Card className="overflow-hidden shadow-2xs">
-        <CardHeader className="border-b border-slate-100 pb-3">
-          <CardTitle className="text-base flex items-center justify-between">
-            <span>Scheduled Monthly Fees & Dues (Recent to Past)</span>
-            <Lock className="h-4 w-4 text-slate-400" />
-          </CardTitle>
-          <CardDescription className="text-xs">
-            Pay for current October 2026 tuition and past due months directly online via UPI/Card.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="p-0">
-          {feesLoading ? (
-            <div className="p-6 space-y-3">
-              {[1, 2, 3].map((i) => (
-                <Skeleton key={i} className="h-12 w-full" />
-              ))}
-            </div>
-          ) : fees.length === 0 ? (
-            <div className="p-8">
-              <EmptyState
-                icon={<CreditCard className="h-8 w-8" />}
-                title="No fee items scheduled"
-                description="Your fee plan has not been assigned by the administration."
-              />
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-slate-50 border-b border-slate-200 text-slate-500 uppercase text-[10px] font-semibold">
-                  <tr>
-                    <th className="py-2.5 px-4">Fee Item</th>
-                    <th className="py-2.5 px-4">Due Date</th>
-                    <th className="py-2.5 px-4">Amount</th>
-                    <th className="py-2.5 px-4">Paid</th>
-                    <th className="py-2.5 px-4">Balance</th>
-                    <th className="py-2.5 px-4">Status</th>
-                    <th className="py-2.5 px-4 text-right">Payment</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {fees.map((fee) => {
-                    const isPayable =
-                      fee.balance_paise > 0 && fee.status !== "CANCELLED";
-                    const isCurrentMonth = fee.due_date.startsWith("2026-10") || fee.title.toLowerCase().includes("oct");
-                    return (
-                      <tr key={fee.id} className={isCurrentMonth ? "bg-blue-50/30 hover:bg-blue-50/50" : "hover:bg-slate-50/50"}>
-                        <td className="py-3 px-4 font-semibold text-slate-900">
-                          <div className="flex items-center gap-1.5">
-                            <span>{fee.title}</span>
-                            {isCurrentMonth && (
-                              <span className="text-[10px] font-bold uppercase bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded">
-                                Current Month
-                              </span>
-                            )}
-                          </div>
-                        </td>
-                        <td className="py-3 px-4 text-slate-600">{formatDate(fee.due_date)}</td>
-                        <td className="py-3 px-4 text-slate-900">{formatCurrency(fee.amount_paise)}</td>
-                        <td className="py-3 px-4 text-emerald-600 font-medium">
-                          {formatCurrency(fee.paid_paise)}
-                        </td>
-                        <td className="py-3 px-4 font-bold text-slate-900">
-                          {formatCurrency(fee.balance_paise)}
-                        </td>
-                        <td className="py-3 px-4">
-                          <Badge
-                            variant={
-                              fee.status === "PAID"
-                                ? "success"
-                                : fee.status === "OVERDUE"
-                                ? "danger"
-                                : fee.status === "PARTIALLY_PAID"
-                                ? "warning"
-                                : "default"
-                            }
-                          >
-                            {fee.status}
-                          </Badge>
-                        </td>
-                        <td className="py-3 px-4 text-right">
-                          {isPayable ? (
-                            <Button
-                              variant="accent"
-                              size="sm"
-                              className="h-7 text-xs font-semibold px-3 shadow-xs"
-                              onClick={() => setPayingFee(fee)}
-                            >
-                              PAY NOW
-                            </Button>
-                          ) : (
-                            <span className="text-xs text-emerald-600 font-medium flex items-center justify-end gap-1">
-                              <CheckCircle2 className="h-3.5 w-3.5" />
-                              Settled
-                            </span>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+      {/* Active & Backend-Preserved Month Cards */}
+      <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
+        <h2 className="font-display text-lg font-extrabold text-[#1E3A8A] mb-4">
+          Current &amp; Archived Monthly Fee Schedule
+        </h2>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {(student.monthly_ledger || []).map((item) => {
+            const isPaid = item.status === "PAID";
+            return (
+              <div
+                key={item.month_year}
+                className={`rounded-xl border p-4 flex flex-col justify-between ${
+                  item.is_current_month
+                    ? "border-2 border-[#2563EB] bg-blue-50/30"
+                    : isPaid
+                    ? "border-emerald-200 bg-emerald-50/30"
+                    : "border-slate-200 bg-white"
+                }`}
+              >
+                <div>
+                  <div className="flex items-center justify-between">
+                    <span className="inline-flex items-center gap-1.5 text-sm font-extrabold text-slate-900">
+                      <Calendar className="h-4 w-4 text-[#1E3A8A]" />
+                      {item.month_label}
+                    </span>
+                    <span
+                      className={`rounded-full px-2.5 py-0.5 text-xs font-extrabold ${
+                        isPaid
+                          ? "bg-emerald-100 text-emerald-800"
+                          : "bg-amber-100 text-amber-800"
+                      }`}
+                    >
+                      {isPaid ? "PAID" : "UNPAID"}
+                    </span>
+                  </div>
+                  <p className="mt-2 text-xl font-extrabold text-[#1E3A8A]">
+                    ₹{Number(item.amount).toFixed(2)}
+                  </p>
+                </div>
 
-      {/* Previous Payments History */}
-      <Card className="overflow-hidden shadow-2xs">
-        <CardHeader className="border-b border-slate-100 pb-3">
-          <CardTitle className="text-base">Payment History</CardTitle>
-          <CardDescription className="text-xs">
-            Past transactions and settlement confirmation logs
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="p-0">
-          {paymentsLoading ? (
-            <div className="p-6 space-y-2">
-              {[1, 2].map((i) => (
-                <Skeleton key={i} className="h-8 w-full" />
-              ))}
-            </div>
-          ) : payments.length === 0 ? (
-            <div className="p-6 text-center text-xs text-slate-500">
-              No previous transactions recorded.
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-slate-50 border-b border-slate-200 text-slate-500 uppercase text-[10px] font-semibold">
-                  <tr>
-                    <th className="py-2.5 px-4">Date</th>
-                    <th className="py-2.5 px-4">Amount</th>
-                    <th className="py-2.5 px-4">Provider</th>
-                    <th className="py-2.5 px-4">Method</th>
-                    <th className="py-2.5 px-4">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {payments.map((p) => (
-                    <tr key={p.id}>
-                      <td className="py-2.5 px-4 text-slate-600">
-                        {formatDateTime(p.paid_at || p.created_at)}
-                      </td>
-                      <td className="py-2.5 px-4 font-bold text-slate-900">
-                        {formatCurrency(p.amount_paise)}
-                      </td>
-                      <td className="py-2.5 px-4 font-mono text-slate-600">{p.provider}</td>
-                      <td className="py-2.5 px-4 uppercase text-[11px] text-slate-600">
-                        {p.method || "—"}
-                      </td>
-                      <td className="py-2.5 px-4">
-                        <Badge variant={p.status === "SUCCESS" ? "success" : "default"}>
-                          {p.status}
-                        </Badge>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+                <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between">
+                  {isPaid ? (
+                    <span className="inline-flex items-center gap-1 text-xs font-bold text-emerald-700">
+                      <CheckCircle2 className="h-4 w-4" />
+                      Payment Settled
+                    </span>
+                  ) : (
+                    <RazorpayCheckoutButton
+                      monthYear={item.month_year}
+                      monthLabel={item.month_label}
+                      monthlyFee={student.monthly_fee}
+                      studentId={student.student_id}
+                      studentName={student.name}
+                      contactNumber={student.contact_number}
+                      compact
+                      onSuccess={refresh}
+                    />
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
 
-      {/* Razorpay Online Checkout Modal */}
-      <RazorpayCheckoutModal
-        fee={payingFee}
-        open={!!payingFee}
-        onOpenChange={(open) => !open && setPayingFee(null)}
-      />
+      {/* Payment History Table */}
+      <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs">
+        <h2 className="font-display text-lg font-extrabold text-[#1E3A8A] mb-4">
+          Backend Archived Payment History &amp; Official Receipts
+        </h2>
+        {student.fee_payments && student.fee_payments.length > 0 ? (
+          <div className="overflow-x-auto rounded-xl border border-slate-200">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-slate-50 text-slate-600 uppercase border-b border-slate-200">
+                <tr>
+                  <th className="py-3 px-4 font-bold">Month</th>
+                  <th className="py-3 px-4 font-bold">Amount</th>
+                  <th className="py-3 px-4 font-bold">Status</th>
+                  <th className="py-3 px-4 font-bold">Reference</th>
+                  <th className="py-3 px-4 font-bold text-right">Receipt</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {student.fee_payments.map((fp) => (
+                  <tr key={fp.id} className="hover:bg-slate-50">
+                    <td className="py-3 px-4 font-bold text-slate-900">
+                      {fp.month_label || fp.month_year}
+                    </td>
+                    <td className="py-3 px-4 font-extrabold text-[#1E3A8A]">
+                      ₹{Number(fp.amount).toFixed(2)}
+                    </td>
+                    <td className="py-3 px-4">
+                      <span
+                        className={`inline-flex rounded-full px-2.5 py-0.5 text-[11px] font-extrabold ${
+                          fp.status === "PAID"
+                            ? "bg-emerald-100 text-emerald-800"
+                            : "bg-amber-100 text-amber-800"
+                        }`}
+                      >
+                        {fp.status}
+                      </span>
+                    </td>
+                    <td className="py-3 px-4 font-mono text-slate-600">
+                      {fp.razorpay_payment_id ||
+                        fp.razorpay_order_id ||
+                        "ADMIN-VERIFIED"}
+                    </td>
+                    <td className="py-3 px-4 text-right">
+                      {fp.status === "PAID" && (
+                        <a
+                          href={`/api/backend/v1/payments/${fp.id}/receipt.pdf`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 font-bold text-[#2563EB] hover:text-[#1E3A8A]"
+                        >
+                          <Download className="h-3.5 w-3.5" />
+                          <span>Download PDF</span>
+                        </a>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="text-xs text-slate-500">
+            No fee payment records found for {activeMonthLabel} yet.
+          </p>
+        )}
+      </div>
     </div>
   );
 }

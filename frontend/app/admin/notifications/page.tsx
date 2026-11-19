@@ -1,170 +1,233 @@
 "use client";
 
 import { useState } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { notificationsApi } from "@/lib/api/notifications";
-import { Card } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Skeleton } from "@/components/ui/skeleton";
-import { EmptyState } from "@/components/ui/empty-state";
-import { Pagination } from "@/components/ui/pagination";
-import { formatDateTime } from "@/lib/utils";
-import { toast } from "sonner";
-import { Bell, RefreshCw, MessageSquare, PhoneCall } from "lucide-react";
-import type { NotificationChannel, NotificationStatus } from "@/types/api";
+import {
+  MessageSquare,
+  Smartphone,
+  Mail,
+  Send,
+  CheckCircle2,
+  Loader2,
+  ExternalLink,
+} from "lucide-react";
+import { api } from "@/lib/api/client";
+import { useToast } from "@/components/ui/toast";
+
+interface DispatchRecord {
+  id: string;
+  student_id: string;
+  student_name: string;
+  contact_number: string;
+  batch: string;
+  month_year: string;
+  amount: number;
+  payment_link: string;
+  whatsapp_url?: string | null;
+  message: string;
+}
 
 export default function AdminNotificationsPage() {
-  const queryClient = useQueryClient();
-  const [page, setPage] = useState(1);
-  const [channelFilter, setChannelFilter] = useState<NotificationChannel | "">("");
-  const [statusFilter, setStatusFilter] = useState<NotificationStatus | "">("");
+  const [monthYear, setMonthYear] = useState("2026-10");
+  const [batch, setBatch] = useState("ALL");
+  const [channels, setChannels] = useState<string[]>([
+    "WHATSAPP",
+    "SMS",
+    "EMAIL",
+  ]);
+  const [isSending, setIsSending] = useState(false);
+  const [dispatches, setDispatches] = useState<DispatchRecord[]>([]);
+  const { toast } = useToast();
 
-  const { data, isLoading } = useQuery({
-    queryKey: ["admin-notifications", page, channelFilter, statusFilter],
-    queryFn: () =>
-      notificationsApi.list({
-        page,
-        page_size: 20,
-        channel: channelFilter || undefined,
-        status: statusFilter || undefined,
-      }),
-  });
+  const toggleChannel = (ch: string) => {
+    setChannels((prev) =>
+      prev.includes(ch) ? prev.filter((c) => c !== ch) : [...prev, ch]
+    );
+  };
 
-  const retryMutation = useMutation({
-    mutationFn: (id: string) => notificationsApi.retry(id),
-    onSuccess: () => {
-      toast.success("Notification requeued for delivery retry.");
-      queryClient.invalidateQueries({ queryKey: ["admin-notifications"] });
-    },
-    onError: () => toast.error("Unable to retry notification."),
-  });
+  const handleDispatch = async () => {
+    if (channels.length === 0) {
+      toast({
+        type: "error",
+        title: "Select at least one channel",
+        description: "Choose WhatsApp, SMS, or Email.",
+      });
+      return;
+    }
 
-  const notifications = data?.items || [];
-  const meta = data?.meta;
+    setIsSending(true);
+    try {
+      const res = await api.post<{
+        total_unpaid_targeted: number;
+        sent_count: number;
+        dispatches: DispatchRecord[];
+      }>("/v1/notifications/bulk-reminders", {
+        month_year: monthYear,
+        batch: batch !== "ALL" ? batch : undefined,
+        channels,
+        limit: 100,
+      });
+
+      setDispatches(res.dispatches || []);
+      toast({
+        type: "success",
+        title: "Reminders Dispatched",
+        description: `Generated & dispatched personalized payment links for ${res.sent_count} unpaid students.`,
+      });
+    } catch (err) {
+      toast({
+        type: "error",
+        title: "Dispatch Failed",
+        description:
+          err instanceof Error ? err.message : "Could not dispatch reminders.",
+      });
+    } finally {
+      setIsSending(false);
+    }
+  };
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight text-slate-900">
-          Notification Delivery
-        </h1>
-        <p className="text-xs text-slate-500 mt-0.5">
-          Delivery tracking and gateway logs for automated WhatsApp reminders and SMS confirmations.
-        </p>
-      </div>
-
-      {/* Filter Toolbar */}
-      <Card className="p-4 shadow-2xs">
-        <div className="flex flex-wrap items-center gap-3">
-          <select
-            value={channelFilter}
-            onChange={(e) => {
-              setChannelFilter(e.target.value as NotificationChannel | "");
-              setPage(1);
-            }}
-            className="h-9 rounded-lg border border-slate-300 bg-white px-3 text-xs text-slate-700 focus:outline-blue-600"
-          >
-            <option value="">All Channels</option>
-            <option value="WHATSAPP">WhatsApp</option>
-            <option value="SMS">SMS</option>
-            <option value="EMAIL">Email</option>
-          </select>
-
-          <select
-            value={statusFilter}
-            onChange={(e) => {
-              setStatusFilter(e.target.value as NotificationStatus | "");
-              setPage(1);
-            }}
-            className="h-9 rounded-lg border border-slate-300 bg-white px-3 text-xs text-slate-700 focus:outline-blue-600"
-          >
-            <option value="">All Statuses</option>
-            <option value="DELIVERED">Delivered</option>
-            <option value="SENT">Sent</option>
-            <option value="QUEUED">Queued</option>
-            <option value="FAILED">Failed</option>
-          </select>
+    <div className="space-y-8">
+      <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs space-y-5">
+        <div>
+          <span className="inline-block rounded-full bg-amber-100 text-amber-800 px-3 py-0.5 text-xs font-extrabold uppercase">
+            Multi-Channel Reminder Engine
+          </span>
+          <h1 className="mt-1.5 font-display text-2xl font-extrabold text-[#1E3A8A]">
+            Automated Fee Payment Notification Dispatcher
+          </h1>
+          <p className="text-xs text-slate-600 mt-1">
+            Dispatch personalized payment reminder links to students with unpaid dues across WhatsApp Cloud API, SMS (Fast2SMS/Twilio), and Email.
+          </p>
         </div>
-      </Card>
 
-      <Card className="overflow-hidden shadow-2xs">
-        {isLoading ? (
-          <div className="p-6 space-y-3">
-            {[1, 2, 3, 4].map((i) => (
-              <Skeleton key={i} className="h-10 w-full" />
-            ))}
-          </div>
-        ) : notifications.length === 0 ? (
-          <div className="p-8">
-            <EmptyState
-              icon={<Bell className="h-8 w-8" />}
-              title="No notifications recorded"
-              description="Notifications are dispatched in background schedules for fee reminders and payment confirmations."
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2">
+          <div>
+            <label className="block text-xs font-bold uppercase text-slate-600 mb-1.5">
+              Target Billing Month
+            </label>
+            <input
+              type="month"
+              value={monthYear}
+              onChange={(e) => setMonthYear(e.target.value)}
+              className="w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-xs font-bold text-slate-900"
             />
           </div>
-        ) : (
-          <div className="overflow-x-auto">
+
+          <div>
+            <label className="block text-xs font-bold uppercase text-slate-600 mb-1.5">
+              Filter by Course Batch
+            </label>
+            <input
+              type="text"
+              value={batch}
+              onChange={(e) => setBatch(e.target.value)}
+              placeholder="ALL or e.g. ADOAP, DCAE"
+              className="w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-xs font-bold text-slate-900"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-bold uppercase text-slate-600 mb-1.5">
+              Active Messaging Channels
+            </label>
+            <div className="flex flex-wrap gap-2">
+              {[
+                { id: "WHATSAPP", label: "WhatsApp", icon: MessageSquare },
+                { id: "SMS", label: "SMS", icon: Smartphone },
+                { id: "EMAIL", label: "Email", icon: Mail },
+              ].map((ch) => {
+                const active = channels.includes(ch.id);
+                const Icon = ch.icon;
+                return (
+                  <button
+                    key={ch.id}
+                    type="button"
+                    onClick={() => toggleChannel(ch.id)}
+                    className={`inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-extrabold transition-colors cursor-pointer ${
+                      active
+                        ? "bg-[#1E3A8A] text-white"
+                        : "bg-slate-100 text-slate-600"
+                    }`}
+                  >
+                    <Icon className="h-3.5 w-3.5 text-[#FBBF24]" />
+                    <span>{ch.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
+        <div className="pt-2">
+          <button
+            type="button"
+            disabled={isSending}
+            onClick={handleDispatch}
+            className="inline-flex items-center gap-2 rounded-xl bg-[#2563EB] hover:bg-[#1E3A8A] disabled:opacity-60 text-white px-6 py-3 text-sm font-extrabold shadow-md transition-colors cursor-pointer"
+          >
+            {isSending ? (
+              <Loader2 className="h-4 w-4 animate-spin text-[#FBBF24]" />
+            ) : (
+              <Send className="h-4 w-4 text-[#FBBF24]" />
+            )}
+            <span>
+              {isSending
+                ? "Dispatching Multi-Channel Reminders..."
+                : `Dispatch Reminders for Unpaid Students (${monthYear})`}
+            </span>
+          </button>
+        </div>
+      </div>
+
+      {dispatches.length > 0 && (
+        <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs space-y-4">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="h-5 w-5 text-emerald-600" />
+            <h2 className="font-display text-lg font-extrabold text-[#1E3A8A]">
+              Dispatched Payment Reminder Links ({dispatches.length})
+            </h2>
+          </div>
+
+          <div className="overflow-x-auto rounded-xl border border-slate-200">
             <table className="w-full text-left text-xs">
-              <thead className="border-b border-slate-200 bg-slate-50 text-slate-600 font-semibold uppercase text-[10px]">
+              <thead className="bg-slate-50 text-slate-600 uppercase border-b border-slate-200">
                 <tr>
-                  <th className="py-3 px-4">Channel</th>
-                  <th className="py-3 px-4">Recipient</th>
-                  <th className="py-3 px-4">Template</th>
-                  <th className="py-3 px-4">Attempts</th>
-                  <th className="py-3 px-4">Status</th>
-                  <th className="py-3 px-4">Timestamp</th>
-                  <th className="py-3 px-4 text-right">Actions</th>
+                  <th className="py-3 px-4 font-bold">Student</th>
+                  <th className="py-3 px-4 font-bold">Batch &amp; Due</th>
+                  <th className="py-3 px-4 font-bold">Personalized Payment Link</th>
+                  <th className="py-3 px-4 font-bold text-right">Direct Launch</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {notifications.map((item) => (
-                  <tr key={item.id} className="hover:bg-slate-50/50">
+                {dispatches.map((d) => (
+                  <tr key={d.id} className="hover:bg-slate-50">
                     <td className="py-3 px-4">
-                      <div className="flex items-center gap-1.5 font-medium text-slate-800">
-                        {item.channel === "WHATSAPP" ? (
-                          <MessageSquare className="h-3.5 w-3.5 text-emerald-600" />
-                        ) : (
-                          <PhoneCall className="h-3.5 w-3.5 text-blue-600" />
-                        )}
-                        {item.channel}
-                      </div>
-                    </td>
-                    <td className="py-3 px-4 font-mono text-slate-900">{item.recipient}</td>
-                    <td className="py-3 px-4 font-mono text-[11px] text-slate-600">{item.template}</td>
-                    <td className="py-3 px-4 text-slate-500">
-                      {item.attempts} / {item.max_attempts}
+                      <p className="font-bold text-slate-900">{d.student_name}</p>
+                      <p className="font-mono text-[11px] text-[#1E3A8A]">
+                        {d.student_id} • {d.contact_number}
+                      </p>
                     </td>
                     <td className="py-3 px-4">
-                      <Badge
-                        variant={
-                          item.status === "DELIVERED" || item.status === "SENT"
-                            ? "success"
-                            : item.status === "FAILED"
-                            ? "danger"
-                            : "warning"
-                        }
-                      >
-                        {item.status}
-                      </Badge>
-                      {item.last_error && (
-                        <p className="text-[10px] text-rose-600 mt-0.5 truncate max-w-xs">
-                          {item.last_error}
-                        </p>
-                      )}
+                      <span className="font-bold text-slate-800">{d.batch}</span>
+                      <p className="text-amber-700 font-extrabold">
+                        ₹{d.amount} ({d.month_year})
+                      </p>
                     </td>
-                    <td className="py-3 px-4 text-slate-500">{formatDateTime(item.created_at)}</td>
+                    <td className="py-3 px-4 font-mono text-[11px] text-slate-600">
+                      {d.payment_link}
+                    </td>
                     <td className="py-3 px-4 text-right">
-                      {item.status === "FAILED" && (
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-7 text-xs text-blue-600"
-                          onClick={() => retryMutation.mutate(item.id)}
+                      {d.whatsapp_url && (
+                        <a
+                          href={d.whatsapp_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 text-[11px] font-extrabold"
                         >
-                          <RefreshCw className="h-3 w-3 mr-1" />
-                          Retry
-                        </Button>
+                          <MessageSquare className="h-3 w-3" />
+                          <span>Open WhatsApp</span>
+                          <ExternalLink className="h-3 w-3" />
+                        </a>
                       )}
                     </td>
                   </tr>
@@ -172,21 +235,8 @@ export default function AdminNotificationsPage() {
               </tbody>
             </table>
           </div>
-        )}
-
-        {meta && (
-          <div className="p-4 border-t border-slate-100">
-            <Pagination
-              page={meta.page}
-              pageSize={meta.page_size}
-              total={meta.total}
-              totalPages={meta.total_pages}
-              onPageChange={setPage}
-              isLoading={isLoading}
-            />
-          </div>
-        )}
-      </Card>
+        </div>
+      )}
     </div>
   );
 }

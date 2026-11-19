@@ -1,76 +1,54 @@
-"""Local ES256 JWT key management and token issuance.
-
-Allows standalone and offline operation without depending on external Supabase Auth servers,
-while producing standard ES256 signed JWTs completely compatible with the existing TokenVerifier.
-"""
+"""Local JWT signing and verification for Brightway Computer Academy Portal."""
 
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import jwt
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec
 
-from app.schemas.auth import TokenOut
+from app.config import Settings
 
-_KEY_FILE = Path(__file__).resolve().parent.parent.parent / ".jwt_signing_key.pem"
-_ISSUER = "https://brightway.academy/auth/v1"
-_AUDIENCE = "authenticated"
+ACCESS_TOKEN_TTL_SECONDS = 86400 * 7  # 7 days
+_ISSUER = "brightway-portal"
 
 
-def _get_or_create_key() -> ec.EllipticCurvePrivateKey:
-    if _KEY_FILE.exists():
-        try:
-            return serialization.load_pem_private_key(_KEY_FILE.read_bytes(), password=None)  # type: ignore[return-value]
-        except Exception:
-            pass
-    key = ec.generate_private_key(ec.SECP256R1())
-    pem = key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption(),
-    )
-    _KEY_FILE.write_bytes(pem)
-    return key
+def _secret(settings: Settings) -> str:
+    raw = settings.supabase_jwt_secret.get_secret_value()
+    if raw and len(raw) >= 16:
+        return raw
+    return "brightway-computer-academy-jwt-signing-secret-2026"
 
 
-_SIGNING_KEY = _get_or_create_key()
-_PUBLIC_KEY = _SIGNING_KEY.public_key()
-
-
-def get_local_public_key() -> Any:
-    return _PUBLIC_KEY
-
-
-def get_local_issuer() -> str:
-    return _ISSUER
-
-
-def issue_token(
-    user_id: UUID,
+def create_access_token(
+    settings: Settings,
     *,
-    email: str | None = None,
-    expires_in: int = 86400 * 7,  # 7 days
-) -> TokenOut:
-    now = datetime.now(UTC)
-    payload = {
+    user_id: UUID,
+    role: str,
+    identifier: str,
+    ttl_seconds: int = ACCESS_TOKEN_TTL_SECONDS,
+) -> str:
+    now = datetime.now(tz=UTC)
+    payload: dict[str, Any] = {
         "sub": str(user_id),
-        "aud": _AUDIENCE,
+        "role": role,
+        "identifier": identifier,
         "iss": _ISSUER,
-        "role": "authenticated",
-        "iat": now,
-        "exp": now + timedelta(seconds=expires_in),
-        "session_id": str(uuid4()),
-        "email": email,
+        "aud": settings.jwt_audience,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(seconds=ttl_seconds)).timestamp()),
     }
-    access_token = jwt.encode(payload, _SIGNING_KEY, algorithm="ES256")
-    refresh_token = f"ref_{uuid4().hex}_{user_id.hex}"
-    return TokenOut(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        token_type="bearer",
-        expires_in=expires_in,
-        user_id=user_id,
-    )
+    return jwt.encode(payload, _secret(settings), algorithm="HS256")
+
+
+def decode_local_token(settings: Settings, token: str) -> dict[str, Any] | None:
+    try:
+        return jwt.decode(
+            token,
+            _secret(settings),
+            algorithms=["HS256"],
+            issuer=_ISSUER,
+            audience=settings.jwt_audience,
+            options={"require": ["sub", "exp", "role"]},
+        )
+    except jwt.PyJWTError:
+        return None

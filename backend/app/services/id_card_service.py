@@ -1,273 +1,272 @@
-"""Template-driven ID-card generation (PDF), stored in the private id-cards bucket."""
+"""Dynamic Digital ID Card Generator (PNG & PDF) for the strict 3-collection MongoDB Atlas schema."""
 
-import logging
+import io
+import re
 from datetime import UTC, datetime
-from io import BytesIO
-from typing import Any, cast
-from uuid import UUID, uuid4
+from typing import Any
+from uuid import UUID
 
-from fpdf.enums import MethodReturnValue
-from PIL import Image
+from fpdf import FPDF
+from PIL import Image, ImageDraw, ImageOps
+from pymongo.database import Database as MongoDatabase
 
-from app.core.permissions import CurrentUser, ensure_student_access
-from app.db.client import Database
-from app.db.transactions import translate_constraint_errors
-from app.exceptions import ConflictError, NotFoundError, StudentNotFoundError
-from app.integrations.storage.service import StorageService
-from app.models.id_card import PLACEHOLDER_PATTERN, IdCard, IdCardLayout, IdCardTemplate
-from app.models.settings import AcademySettings
-from app.repositories.id_card_repository import IdCardRepository, IdCardTemplateRepository
-from app.repositories.student_repository import StudentRepository
-from app.schemas.id_card import TemplateCreate, TemplateUpdate
-from app.services.audit_service import record_audit
-from app.services.settings_service import load_academy
-from app.utils.pdf import PdfDocument, PdfFonts, hex_to_rgb, new_pdf
-
-logger = logging.getLogger(__name__)
-
-_PT_TO_MM = 0.3528
-_MIN_FONT_SIZE = 5.0
-SAMPLE_CONTEXT = {
-    "academy_name": "Brightway Computer Academy",
-    "student_id": "BCA00001",
-    "name": "Sample Student",
-    "guardian_name": "Sample Guardian",
-    "course": "Diploma in Computer Applications",
-    "contact": "+91 98765 43210",
-    "address": "12 Example Road, Sample Town, West Bengal 700001",
-}
-
-_TEMPLATE_CONSTRAINTS = {
-    "id_card_templates_name_key": lambda: ConflictError(
-        "A template with this name already exists.", code="DUPLICATE_TEMPLATE_NAME"
-    ),
-}
+from app.core.errors import NotFoundError
+from app.core.permissions import assert_student_self_or_staff
+from app.core.security import CurrentUser
+from app.integrations.storage import StorageProvider
 
 
-def render_placeholders(text: str, context: dict[str, str]) -> str:
-    return PLACEHOLDER_PATTERN.sub(lambda match: context.get(match.group(1), ""), text)
-
-
-def build_context(student: dict[str, Any], academy: AcademySettings) -> dict[str, str]:
-    return {
-        "academy_name": academy.name,
-        "student_id": student["id_no"],
-        "name": student["name"],
-        "guardian_name": student.get("guardian_name") or "",
-        "course": student.get("course_name") or student.get("legacy_course") or "",
-        "contact": student.get("contact") or "",
-        "address": student.get("address") or "",
-    }
-
-
-def _fit_single_line(doc: PdfDocument, text: str, width: float, size: float, style: str) -> str:
-    """Shrink the font until the text fits; truncate with an ellipsis as a last resort."""
-    pdf = doc.pdf
-    while size > _MIN_FONT_SIZE and pdf.get_string_width(text) > width:
-        size -= 0.5
-        pdf.set_font(doc.family, style, size)
-    if pdf.get_string_width(text) <= width:
-        return text
-    while text and pdf.get_string_width(text + "...") > width:
-        text = text[:-1]
-    return text + "..."
-
-
-def render_id_card_pdf(
-    layout: IdCardLayout, context: dict[str, str], photo: bytes | None, fonts: PdfFonts
-) -> bytes:
-    doc = new_pdf(fonts, width_mm=layout.width_mm, height_mm=layout.height_mm)
-    pdf = doc.pdf
-    pdf.add_page()
-    pdf.set_fill_color(*hex_to_rgb(layout.background_color))
-    pdf.rect(0, 0, layout.width_mm, layout.height_mm, style="F")
-
-    for element in layout.elements:
-        if element.type == "rect":
-            pdf.set_fill_color(*hex_to_rgb(element.fill))
-            pdf.rect(element.x, element.y, element.w, element.h, style="F")
-        elif element.type == "image":
-            if photo:
-                with Image.open(BytesIO(photo)) as image:
-                    width_px, height_px = image.size
-                scale = min(element.w / width_px, element.h / height_px)
-                draw_w, draw_h = width_px * scale, height_px * scale
-                pdf.image(
-                    BytesIO(photo),
-                    x=element.x + (element.w - draw_w) / 2,
-                    y=element.y + (element.h - draw_h) / 2,
-                    w=draw_w,
-                    h=draw_h,
-                )
-            else:
-                pdf.set_draw_color(150, 150, 150)
-                pdf.rect(element.x, element.y, element.w, element.h, style="D")
-                pdf.set_font(doc.family, "", 6)
-                pdf.set_text_color(150, 150, 150)
-                pdf.set_xy(element.x, element.y + element.h / 2 - 2)
-                pdf.cell(element.w, 4, text="PHOTO", align="C")
-        else:
-            style = "B" if element.bold else ""
-            pdf.set_font(doc.family, style, element.font_size)
-            pdf.set_text_color(*hex_to_rgb(element.color))
-            content = doc.text(render_placeholders(element.text, context))
-            line_height = element.font_size * _PT_TO_MM * 1.2
-            pdf.set_xy(element.x, element.y)
-            if element.multiline:
-                lines = cast(
-                    list[str],
-                    pdf.multi_cell(
-                        element.w,
-                        line_height,
-                        text=content,
-                        align=element.align,
-                        dry_run=True,
-                        output=MethodReturnValue.LINES,
-                    ),
-                )
-                max_lines = max(int(element.h // line_height), 1)
-                if len(lines) > max_lines:
-                    lines = [*lines[: max_lines - 1], lines[max_lines - 1].rstrip() + "..."]
-                pdf.set_xy(element.x, element.y)
-                pdf.multi_cell(element.w, line_height, text="\n".join(lines), align=element.align)
-            else:
-                content = _fit_single_line(doc, content, element.w, element.font_size, style)
-                pdf.cell(element.w, element.h, text=content, align=element.align)
-    return doc.output()
+def _latin1(value: str | None) -> str:
+    if not value:
+        return "-"
+    return value.encode("latin-1", errors="replace").decode("latin-1")
 
 
 class IdCardService:
-    def __init__(self, db: Database, storage: StorageService, fonts: PdfFonts) -> None:
-        self.db = db
-        self.storage = storage
-        self.fonts = fonts
+    def __init__(
+        self,
+        conn: MongoDatabase[dict[str, Any]],
+        storage: StorageProvider | None = None,
+    ) -> None:
+        self._db = conn
+        self._storage = storage
 
-    # ------------------------------------------------------------------ templates
-    def list_templates(self) -> list[IdCardTemplate]:
-        with self.db.transaction() as conn:
-            rows = IdCardTemplateRepository(conn).search()
-        return [IdCardTemplate.model_validate(r) for r in rows]
+    def _get_student_row(self, identifier: str | UUID) -> dict[str, Any]:
+        try:
+            uid = UUID(str(identifier))
+            row = self._db["students"].find_one({"id": str(uid)})
+            if row:
+                return dict(row)
+        except ValueError:
+            pass
 
-    def create_template(self, actor: CurrentUser, payload: TemplateCreate) -> IdCardTemplate:
-        with self.db.transaction() as conn:
-            repo = IdCardTemplateRepository(conn)
-            if payload.is_default:
-                repo.clear_default()
-            with translate_constraint_errors(_TEMPLATE_CONSTRAINTS):
-                row = repo.insert(
-                    {
-                        "name": payload.name,
-                        "layout": payload.layout.model_dump(mode="json"),
-                        "is_default": payload.is_default,
-                    }
-                )
-            record_audit(
-                conn,
-                actor_id=actor.user_id,
-                action="id_card_template.created",
-                entity_type="id_card_template",
-                entity_id=row["id"],
-                after=row,
-            )
-        return IdCardTemplate.model_validate(row)
+        code = str(identifier).strip()
+        row = self._db["students"].find_one(
+            {"student_id": code.upper()}
+        ) or self._db["students"].find_one(
+            {"student_id": {"$regex": f"^{re.escape(code)}$", "$options": "i"}}
+        )
+        if not row:
+            raise NotFoundError("student", identifier)
+        return dict(row)
 
-    def update_template(
-        self, actor: CurrentUser, template_id: UUID, payload: TemplateUpdate
-    ) -> IdCardTemplate:
-        changes: dict[str, Any] = payload.model_dump(exclude_unset=True, exclude={"layout"})
-        if payload.layout is not None:
-            changes["layout"] = payload.layout.model_dump(mode="json")
-        with self.db.transaction() as conn:
-            repo = IdCardTemplateRepository(conn)
-            current = repo.get_by_id(template_id, for_update=True)
-            if current is None:
-                raise NotFoundError("Template was not found.", code="TEMPLATE_NOT_FOUND")
-            if changes.get("is_default"):
-                repo.clear_default()
-            with translate_constraint_errors(_TEMPLATE_CONSTRAINTS):
-                row = repo.update_fields(template_id, changes)
-            record_audit(
-                conn,
-                actor_id=actor.user_id,
-                action="id_card_template.updated",
-                entity_type="id_card_template",
-                entity_id=template_id,
-                before=current,
-                after=row,
-            )
-        return IdCardTemplate.model_validate(row)
+    def _load_photo_bytes(self, student_code: str) -> bytes | None:
+        if self._storage is None:
+            return None
+        safe_code = re.sub(r"[^A-Za-z0-9_-]", "_", student_code)
+        try:
+            return self._storage.get(bucket="student-photos", key=f"{safe_code}.jpg")
+        except Exception:
+            return None
 
-    def preview_template(self, template_id: UUID) -> bytes:
-        with self.db.transaction() as conn:
-            row = IdCardTemplateRepository(conn).get_by_id(template_id)
-            academy = load_academy(conn)
-        if row is None:
-            raise NotFoundError("Template was not found.", code="TEMPLATE_NOT_FOUND")
-        context = {**SAMPLE_CONTEXT, "academy_name": academy.name}
-        return render_id_card_pdf(
-            IdCardLayout.model_validate(row["layout"]), context, None, self.fonts
+    def get_card_metadata(
+        self, actor: CurrentUser, identifier: str | UUID
+    ) -> dict[str, Any]:
+        row = self._get_student_row(identifier)
+        assert_student_self_or_staff(
+            actor,
+            student_uuid=UUID(str(row["id"])),
+            student_id_code=row["student_id"],
+        )
+        code = row["student_id"]
+        return {
+            "id": str(row["id"]),
+            "student_id": str(row["id"]),
+            "student_code": code,
+            "card_number": f"BW-ID-{code}",
+            "name": row["name"],
+            "contact_number": row["contact_number"],
+            "batch": row["batch"],
+            "photo_url": row.get("photo_url") or f"/api/v1/students/{code}/photo",
+            "pdf_url": f"/api/v1/students/{code}/id-card.pdf",
+            "png_url": f"/api/v1/students/{code}/id-card.png",
+            "status": "ACTIVE",
+            "issued_at": datetime.now(tz=UTC).isoformat(),
+        }
+
+    def render_pdf(
+        self, actor: CurrentUser, identifier: str | UUID
+    ) -> tuple[bytes, str]:
+        row = self._get_student_row(identifier)
+        assert_student_self_or_staff(
+            actor,
+            student_uuid=UUID(str(row["id"])),
+            student_id_code=row["student_id"],
+        )
+        code = row["student_id"]
+        photo_bytes = self._load_photo_bytes(code)
+
+        # CR80 Landscape: 85.6mm x 54.0mm
+        pdf = FPDF(orientation="L", unit="mm", format=(54.0, 85.6))
+        pdf.set_auto_page_break(False)
+        pdf.set_margins(0, 0, 0)
+        pdf.add_page()
+
+        # White card base
+        pdf.set_fill_color(255, 255, 255)
+        pdf.rect(0, 0, 85.6, 54.0, style="F")
+
+        # Deep Trust Blue header (#1E3A8A)
+        pdf.set_fill_color(30, 58, 138)
+        pdf.rect(0, 0, 85.6, 13.5, style="F")
+
+        # Gold accent bar (#F59E0B)
+        pdf.set_fill_color(245, 158, 11)
+        pdf.rect(0, 13.5, 85.6, 1.4, style="F")
+
+        # Academy Header Text
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 8.5)
+        pdf.set_xy(4.0, 2.5)
+        pdf.cell(77.6, 4.2, _latin1("BRIGHTWAY COMPUTER EDUCATION"), align="L")
+        pdf.set_font("Helvetica", "", 5.5)
+        pdf.set_text_color(251, 191, 36)
+        pdf.set_xy(4.0, 7.2)
+        pdf.cell(
+            77.6,
+            3.5,
+            _latin1("AFFILIATED TO RGYCSM (rgycsm.org)  |  STUDENT IDENTITY CARD"),
+            align="L",
         )
 
-    # ------------------------------------------------------------------ cards
-    def generate(
-        self, actor: CurrentUser, student_id: UUID, template_id: UUID | None = None
-    ) -> IdCard:
-        with self.db.transaction() as conn:
-            student = StudentRepository(conn).get(student_id)
-            if student is None:
-                raise StudentNotFoundError()
-            templates = IdCardTemplateRepository(conn)
-            template = templates.get_by_id(template_id) if template_id else templates.get_default()
-            if template is None or not template["active"]:
-                raise NotFoundError(
-                    "No active ID-card template is configured.", code="TEMPLATE_NOT_FOUND"
-                )
-            academy = load_academy(conn)
+        # Photo Frame (Left)
+        photo_x, photo_y, photo_w, photo_h = 4.5, 17.5, 21.0, 25.5
+        pdf.set_draw_color(37, 99, 235)
+        pdf.set_line_width(0.4)
+        pdf.rect(photo_x - 0.4, photo_y - 0.4, photo_w + 0.8, photo_h + 0.8, style="D")
 
-        photo = None
-        if student["photo_path"]:
-            photo = self.storage.download(self.storage.photo_bucket, student["photo_path"])
-        pdf = render_id_card_pdf(
-            IdCardLayout.model_validate(template["layout"]),
-            build_context(student, academy),
-            photo,
-            self.fonts,
+        placed = False
+        if photo_bytes:
+            try:
+                with Image.open(io.BytesIO(photo_bytes)) as im:
+                    rgb = ImageOps.exif_transpose(im).convert("RGB")
+                    fitted = ImageOps.fit(rgb, (300, 360))
+                    buf = io.BytesIO()
+                    fitted.save(buf, format="JPEG", quality=92)
+                    buf.seek(0)
+                    pdf.image(buf, x=photo_x, y=photo_y, w=photo_w, h=photo_h)
+                    placed = True
+            except Exception:
+                placed = False
+
+        if not placed:
+            pdf.set_fill_color(239, 246, 255)
+            pdf.rect(photo_x, photo_y, photo_w, photo_h, style="F")
+            initials = (
+                "".join(p[0] for p in row["name"].split()[:2] if p).upper() or "BW"
+            )
+            pdf.set_text_color(30, 58, 138)
+            pdf.set_font("Helvetica", "B", 13)
+            pdf.set_xy(photo_x, photo_y + 8.5)
+            pdf.cell(photo_w, 8, _latin1(initials), align="C")
+
+        # Student Details (Right)
+        info_x = 28.5
+        pdf.set_xy(info_x, 17.0)
+        pdf.set_text_color(15, 23, 42)
+        pdf.set_font("Helvetica", "B", 8.5)
+        pdf.cell(54.0, 4.5, _latin1(row["name"].upper()[:28]))
+
+        fields = [
+            ("STUDENT ID", code),
+            ("BATCH", str(row["batch"])[:30]),
+            ("CONTACT", str(row["contact_number"])),
+            ("VALIDITY", "ACADEMIC SESSION 2026-2027"),
+        ]
+        y = 22.8
+        for label, val in fields:
+            pdf.set_xy(info_x, y)
+            pdf.set_font("Helvetica", "B", 5.2)
+            pdf.set_text_color(100, 116, 139)
+            pdf.cell(16.0, 3.6, _latin1(label))
+            pdf.set_font("Helvetica", "B", 6.3)
+            pdf.set_text_color(30, 58, 138 if label == "STUDENT ID" else 15)
+            pdf.cell(38.0, 3.6, _latin1(val))
+            y += 4.8
+
+        # Footer Bar
+        pdf.set_fill_color(30, 58, 138)
+        pdf.rect(0, 47.5, 85.6, 6.5, style="F")
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 5.2)
+        pdf.set_xy(4.5, 49.0)
+        pdf.cell(45.0, 3.5, _latin1(f"ID NO: {code}"), align="L")
+        pdf.set_text_color(251, 191, 36)
+        pdf.set_xy(45.0, 49.0)
+        pdf.cell(36.5, 3.5, _latin1("AUTHORIZED SIGNATORY"), align="R")
+
+        return bytes(pdf.output()), f"Brightway-ID-{code}.pdf"
+
+    def render_png(
+        self, actor: CurrentUser, identifier: str | UUID
+    ) -> tuple[bytes, str]:
+        row = self._get_student_row(identifier)
+        assert_student_self_or_staff(
+            actor,
+            student_uuid=UUID(str(row["id"])),
+            student_id_code=row["student_id"],
         )
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
-        path = f"{student_id}/{stamp}-{uuid4().hex[:8]}.pdf"
-        self.storage.upload(self.storage.id_card_bucket, path, pdf, "application/pdf")
+        code = row["student_id"]
+        photo_bytes = self._load_photo_bytes(code)
 
-        with self.db.transaction() as conn:
-            row = IdCardRepository(conn).insert(
-                {
-                    "student_id": student_id,
-                    "template_id": template["id"],
-                    "file_path": path,
-                    "generated_by": actor.user_id,
-                }
+        # Render 1012 x 638 CR80 300-DPI PNG ID Card
+        w, h = 1012, 638
+        card = Image.new("RGB", (w, h), (255, 255, 255))
+        draw = ImageDraw.Draw(card)
+
+        # Header (#1E3A8A) + Gold bar (#F59E0B)
+        draw.rectangle((0, 0, w, 155), fill=(30, 58, 138))
+        draw.rectangle((0, 155, w, 170), fill=(245, 158, 11))
+
+        draw.text((48, 38), "BRIGHTWAY COMPUTER EDUCATION", fill=(255, 255, 255))
+        draw.text(
+            (48, 88), "AFFILIATED TO RGYCSM (rgycsm.org)  |  STUDENT ID CARD", fill=(251, 191, 36)
+        )
+
+        # Photo region
+        px, py, pw, ph = 52, 205, 240, 290
+        draw.rectangle(
+            (px - 4, py - 4, px + pw + 4, py + ph + 4),
+            outline=(37, 99, 235),
+            width=4,
+        )
+        placed = False
+        if photo_bytes:
+            try:
+                with Image.open(io.BytesIO(photo_bytes)) as im:
+                    rgb = ImageOps.exif_transpose(im).convert("RGB")
+                    fitted = ImageOps.fit(rgb, (pw, ph))
+                    card.paste(fitted, (px, py))
+                    placed = True
+            except Exception:
+                placed = False
+        if not placed:
+            draw.rectangle((px, py, px + pw, py + ph), fill=(239, 246, 255))
+            initials = (
+                "".join(p[0] for p in row["name"].split()[:2] if p).upper() or "BW"
             )
-            StudentRepository(conn).update_fields(student_id, {"id_card_path": path})
-            record_audit(
-                conn,
-                actor_id=actor.user_id,
-                action="id_card.generated",
-                entity_type="student",
-                entity_id=student_id,
-                after={"id_card_id": str(row["id"]), "template_id": str(template["id"])},
-            )
-        return IdCard.model_validate(row)
+            draw.text((px + 95, py + 130), initials, fill=(30, 58, 138))
 
-    def download_latest(self, user: CurrentUser, student_id: UUID) -> bytes:
-        with self.db.transaction() as conn:
-            ensure_student_access(conn, user, student_id)
-            student = StudentRepository(conn).get_by_id(student_id)
-        if student is None:
-            raise StudentNotFoundError()
-        if not student["id_card_path"]:
-            raise NotFoundError("The ID card has not been generated yet.", code="ID_CARD_NOT_FOUND")
-        return self.storage.download(self.storage.id_card_bucket, student["id_card_path"])
+        # Student Details
+        ix = 330
+        draw.text((ix, 210), f"NAME: {row['name'].upper()}", fill=(15, 23, 42))
+        draw.text((ix, 270), f"STUDENT ID: {code}", fill=(37, 99, 235))
+        draw.text((ix, 330), f"BATCH: {row['batch']}", fill=(51, 65, 85))
+        draw.text((ix, 390), f"CONTACT: {row['contact_number']}", fill=(51, 65, 85))
+        draw.text(
+            (ix, 450),
+            f"MONTHLY FEE: INR {float(row['monthly_fee']):.2f}",
+            fill=(51, 65, 85),
+        )
 
-    def history(self, student_id: UUID) -> list[IdCard]:
-        with self.db.transaction() as conn:
-            rows = IdCardRepository(conn).list_for_student(student_id)
-        return [IdCard.model_validate(r) for r in rows]
+        # Footer
+        draw.rectangle((0, 560, w, h), fill=(30, 58, 138))
+        draw.text(
+            (48, 590),
+            f"BRIGHTWAY PORTAL VERIFIED  |  ID: {code}",
+            fill=(255, 255, 255),
+        )
+
+        buf = io.BytesIO()
+        card.save(buf, format="PNG")
+        return buf.getvalue(), f"Brightway-ID-{code}.png"

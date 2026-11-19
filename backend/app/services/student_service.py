@@ -1,510 +1,747 @@
-"""Student records: create, read, search, update, deactivate and photographs."""
+"""Student profile, photo upload, admin inline editing, and active-month fee status service (MongoDB Atlas).
 
-import logging
-from urllib.parse import quote_plus
+Canonical Student Schema:
+  NAME (`name`)
+  STUDENT ID (`student_id` - can be assigned/edited by Admin if blank in CSV)
+  PASSWORD (`password` - stored & editable by Admin)
+  CONTACT NO. (`contact_number`)
+  COURSE (`course` / `batch`)
+  FEES (`monthly_fee` & `fee_status`: PAID | UNPAID)
+  MONTH (`month` - e.g. '2027-12' / 'December 2027')
+"""
+
+import io
+import re
+import time
+from datetime import UTC, datetime
+from decimal import Decimal
+from typing import Any
 from uuid import UUID, uuid4
 
-from app.core.passwords import hash_password
-from app.core.permissions import CurrentUser, ensure_student_access
-from app.db.client import Database, DbConnection
-from app.db.transactions import translate_constraint_errors
-from app.exceptions import (
-    AppError,
-    DuplicateStudentError,
-    ForbiddenError,
-    NotFoundError,
-    StudentNotFoundError,
-    ValidationFailedError,
-)
-from app.integrations.storage.service import StorageService
-from app.models.notification import NotificationTemplate
-from app.models.student import Student, StudentMonthlyFee, StudentStatus
-from app.repositories.course_repository import CourseRepository
-from app.repositories.notification_repository import NotificationRepository
-from app.repositories.student_repository import StudentRepository
-from app.repositories.user_repository import UserRepository
-from app.schemas.student import (
-    BroadcastDueNoticeResult,
-    DueFeeNoticeResult,
-    StudentCreate,
-    StudentPhotoResult,
-    StudentUpdate,
-)
-from app.services.audit_service import record_audit
-from app.services.id_card_service import IdCardService
-from app.services.notification_service import NotificationService
-from app.services.settings_service import load_academy
-from app.utils.dates import local_today
-from app.utils.file_validation import validate_image
-from app.utils.id_generator import generate_student_id
+from PIL import Image, ImageDraw, ImageOps
+from pymongo import ASCENDING, ReturnDocument
+from pymongo.database import Database as MongoDatabase
+from pymongo.errors import DuplicateKeyError
+
+from app.core.constants import format_month_label, get_active_month
+from app.core.errors import ConflictError, NotFoundError, ValidationError
+from app.core.passwords import generate_student_passcode
+from app.core.permissions import assert_student_self_or_staff
+from app.core.security import CurrentUser
+from app.integrations.storage import StorageProvider
 from app.utils.pagination import Page, PageParams
-from app.utils.pdf import format_inr
-from app.utils.validators import normalize_indian_phone
 
-logger = logging.getLogger(__name__)
+MAX_PHOTO_BYTES = 2 * 1024 * 1024  # 2 MB strict limit
+ALLOWED_IMAGE_MIMES = {"image/jpeg", "image/jpg", "image/png"}
 
-_CONSTRAINTS = {
-    "students_id_no_key": DuplicateStudentError,
-    "students_id_no_lower_key": DuplicateStudentError,
-}
+
+def _try_uuid(val: str | UUID) -> UUID | None:
+    if isinstance(val, UUID):
+        return val
+    try:
+        return UUID(str(val))
+    except ValueError:
+        return None
+
+
+def _validate_and_normalize_photo(raw: bytes, content_type: str | None) -> bytes:
+    if not raw:
+        raise ValidationError("Uploaded photo file is empty.")
+    if len(raw) > MAX_PHOTO_BYTES:
+        raise ValidationError("Photo exceeds the maximum allowed size of 2 MB.")
+    if content_type and content_type.lower() not in ALLOWED_IMAGE_MIMES:
+        raise ValidationError("Only PNG and JPEG images are allowed.")
+
+    is_jpeg = raw[:3] == b"\xff\xd8\xff"
+    is_png = raw[:8] == b"\x89PNG\r\n\x1a\n"
+    if not (is_jpeg or is_png):
+        raise ValidationError(
+            "Invalid image file signature. Upload a valid PNG or JPEG photo."
+        )
+
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            img_oriented = ImageOps.exif_transpose(img)
+            rgb = img_oriented.convert("RGB")
+            fitted = ImageOps.fit(rgb, (600, 720), method=Image.Resampling.LANCZOS)
+            out = io.BytesIO()
+            fitted.save(out, format="JPEG", quality=90, optimize=True)
+            return out.getvalue()
+    except Exception as exc:
+        raise ValidationError(
+            "Uploaded file could not be decoded as a valid image."
+        ) from exc
+
+
+def _render_fallback_avatar(name: str, student_id: str) -> bytes:
+    img = Image.new("RGB", (400, 480), (30, 58, 138))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((0, 420, 400, 480), fill=(245, 158, 11))
+    initials = "".join(p[0] for p in (name or "BW").split()[:2] if p).upper() or "BW"
+    draw.ellipse(
+        (110, 90, 290, 270), fill=(37, 99, 235), outline=(251, 191, 36), width=5
+    )
+    draw.text((165, 155), initials, fill=(255, 255, 255))
+    draw.text((135, 310), student_id or "UNASSIGNED", fill=(226, 232, 240))
+    draw.text((115, 440), "BRIGHTWAY ACADEMY", fill=(15, 23, 42))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 class StudentService:
     def __init__(
         self,
-        db: Database,
-        storage: StorageService,
-        id_cards: IdCardService,
-        *,
-        max_photo_bytes: int,
-        timezone: str,
+        conn: MongoDatabase[dict[str, Any]],
+        storage: StorageProvider | None = None,
     ) -> None:
-        self.db = db
-        self.storage = storage
-        self.id_cards = id_cards
-        self.max_photo_bytes = max_photo_bytes
-        self.timezone = timezone
+        self._db = conn
+        self._storage = storage
 
-    def search(
+    def _fetch_raw_student(self, identifier: str | UUID) -> dict[str, Any]:
+        uid = _try_uuid(identifier)
+        if uid is not None:
+            row = self._db["students"].find_one({"id": str(uid)})
+            if row:
+                return dict(row)
+
+        code = str(identifier).strip()
+        if code:
+            row = self._db["students"].find_one(
+                {"student_id": code.upper()}
+            ) or self._db["students"].find_one(
+                {"student_id": {"$regex": f"^{re.escape(code)}$", "$options": "i"}}
+            )
+            if row:
+                return dict(row)
+
+        raise NotFoundError("student", identifier)
+
+    def _set_month_payment_status(
         self,
-        user: CurrentUser,
         *,
-        q: str | None = None,
-        course_id: UUID | None = None,
-        batch_id: UUID | None = None,
-        status: StudentStatus | None = None,
-        program: str | None = None,
-        has_id: bool | None = None,
-        fee_status: str | None = None,
+        student_uuid_str: str,
+        student_id_code: str,
+        month_year: str,
+        status: str,
+        amount: float,
+    ) -> None:
+        norm_status = status.strip().upper()
+        if norm_status == "PAID":
+            self._db["fee_payments"].update_one(
+                {"student_key": student_uuid_str, "month_year": month_year},
+                {
+                    "$set": {
+                        "student_key": student_uuid_str,
+                        "student_id": student_id_code,
+                        "amount": amount,
+                        "month_year": month_year,
+                        "status": "PAID",
+                        "payment_date": datetime.now(tz=UTC),
+                    },
+                    "$setOnInsert": {
+                        "id": str(uuid4()),
+                        "razorpay_order_id": None,
+                        "razorpay_payment_id": f"ADMIN-{month_year}",
+                    },
+                },
+                upsert=True,
+            )
+        else:
+            self._db["fee_payments"].delete_many(
+                {
+                    "$or": [
+                        {"student_key": student_uuid_str, "month_year": month_year},
+                        *(
+                            [{"student_id": student_id_code, "month_year": month_year}]
+                            if student_id_code
+                            else []
+                        ),
+                    ]
+                }
+            )
+
+    def _build_student_payload(
+        self,
+        row: dict[str, Any],
+        *,
+        include_payments: bool = True,
+        active_month: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_month = get_active_month(active_month)
+        student_uuid_str = str(row["id"])
+        student_code: str = row.get("student_id") or ""
+        course: str = row.get("course") or row.get("batch") or "GENERAL"
+        contact: str = row.get("contact_number") or ""
+        monthly_fee = Decimal(str(row.get("monthly_fee", 600))).quantize(
+            Decimal("0.01")
+        )
+        monthly_fee_float = float(monthly_fee)
+        monthly_fee_paise = int(monthly_fee * 100)
+
+        stored_password = row.get("password") or generate_student_passcode(
+            row["name"], student_code, contact
+        )
+
+        payments_list: list[dict[str, Any]] = []
+        payments_by_month: dict[str, dict[str, Any]] = {}
+
+        if include_payments:
+            or_clauses: list[dict[str, Any]] = [{"student_key": student_uuid_str}]
+            if student_code:
+                or_clauses.append({"student_id": student_code})
+
+            payment_rows = list(
+                self._db["fee_payments"]
+                .find({"$or": or_clauses})
+                .sort([("month_year", -1), ("payment_date", -1)])
+            )
+
+            for p in payment_rows:
+                amt = Decimal(str(p.get("amount", monthly_fee))).quantize(
+                    Decimal("0.01")
+                )
+                p_date = p.get("payment_date")
+                p_dict = {
+                    "id": str(p["id"]),
+                    "student_id": student_code or p.get("student_id", ""),
+                    "amount": float(amt),
+                    "amount_paise": int(amt * 100),
+                    "month_year": p["month_year"],
+                    "month_label": format_month_label(p["month_year"]),
+                    "razorpay_order_id": p.get("razorpay_order_id"),
+                    "razorpay_payment_id": p.get("razorpay_payment_id"),
+                    "status": p["status"],
+                    "payment_date": (
+                        p_date.isoformat() if isinstance(p_date, datetime) else p_date
+                    ),
+                }
+                payments_list.append(p_dict)
+                payments_by_month[p["month_year"]] = p_dict
+
+        active_payment = payments_by_month.get(resolved_month)
+        current_month_status = (
+            "PAID"
+            if (active_payment and active_payment["status"] == "PAID")
+            else "UNPAID"
+        )
+
+        # Build clean ledger starting from active month + any historical months stored in backend
+        all_months = sorted(
+            {resolved_month, *payments_by_month.keys()}, reverse=True
+        )
+        monthly_ledger: list[dict[str, Any]] = []
+        for m_key in all_months:
+            existing = payments_by_month.get(m_key)
+            status_val = (
+                "PAID" if (existing and existing["status"] == "PAID") else "UNPAID"
+            )
+            amt_val = existing["amount"] if existing else monthly_fee_float
+            monthly_ledger.append(
+                {
+                    "month_year": m_key,
+                    "month_label": format_month_label(m_key),
+                    "month_short": format_month_label(m_key)[:3],
+                    "amount": amt_val,
+                    "amount_paise": int(Decimal(str(amt_val)) * 100),
+                    "status": status_val,
+                    "is_current_month": m_key == resolved_month,
+                    "razorpay_order_id": (
+                        existing["razorpay_order_id"] if existing else None
+                    ),
+                    "razorpay_payment_id": (
+                        existing["razorpay_payment_id"] if existing else None
+                    ),
+                    "payment_date": existing["payment_date"] if existing else None,
+                }
+            )
+
+        created_at = row.get("created_at")
+        created_iso = (
+            created_at.isoformat()
+            if isinstance(created_at, datetime)
+            else str(created_at or "")
+        )
+
+        return {
+            "id": student_uuid_str,
+            "name": row["name"],
+            "full_name": row["name"],
+            "student_id": student_code,
+            "enrollment_number": student_code,
+            "has_student_id": bool(student_code),
+            "password": stored_password,
+            "initial_passcode": stored_password,
+            "contact_number": contact,
+            "phone": contact,
+            "course": course,
+            "batch": course,
+            "batch_name": course,
+            "monthly_fee": monthly_fee_float,
+            "monthly_fee_paise": monthly_fee_paise,
+            "fee_status": current_month_status,
+            "current_month_status": current_month_status,
+            "month": resolved_month,
+            "current_month": resolved_month,
+            "month_label": format_month_label(resolved_month),
+            "photo_url": row.get("photo_url"),
+            "created_at": created_iso,
+            "active": True,
+            "fee_payments": payments_list,
+            "monthly_ledger": monthly_ledger,
+        }
+
+    def get(self, actor: CurrentUser, student_identifier: str | UUID) -> dict[str, Any]:
+        row = self._fetch_raw_student(student_identifier)
+        assert_student_self_or_staff(
+            actor,
+            student_uuid=UUID(str(row["id"])),
+            student_id_code=row.get("student_id"),
+        )
+        return self._build_student_payload(row, include_payments=True)
+
+    def get_me(self, actor: CurrentUser) -> dict[str, Any]:
+        if actor.student_id:
+            row = self._fetch_raw_student(actor.student_id)
+        else:
+            row = self._fetch_raw_student(actor.id)
+        return self._build_student_payload(row, include_payments=True)
+
+    def list(
+        self,
         params: PageParams,
-    ) -> Page[Student]:
-        if user.is_student:
-            raise ForbiddenError("Students can only view their own record.")
-        with self.db.transaction() as conn:
-            rows, total = StudentRepository(conn).search(
-                q=q,
-                course_id=course_id,
-                batch_id=batch_id,
-                status=status.value if status else None,
-                program=program,
-                has_id=has_id,
-                fee_status=fee_status,
-                teacher_id=user.teacher_id if user.is_teacher else None,
-                limit=params.limit,
-                offset=params.offset,
-            )
-        return Page([Student.model_validate(r) for r in rows], total, params)
-
-    def get(self, user: CurrentUser, student_id: UUID) -> Student:
-        with self.db.transaction() as conn:
-            ensure_student_access(conn, user, student_id)
-            row = StudentRepository(conn).get(student_id)
-        if row is None:
-            raise StudentNotFoundError()
-        return Student.model_validate(row)
-
-    def get_own(self, user: CurrentUser) -> Student:
-        if not user.is_student or user.student_id is None:
-            raise ForbiddenError()
-        return self.get(user, user.student_id)
-
-    def get_monthly_fees(self, user: CurrentUser, student_id: UUID) -> list[StudentMonthlyFee]:
-        with self.db.transaction() as conn:
-            ensure_student_access(conn, user, student_id)
-            rows = StudentRepository(conn).get_monthly_fees(student_id)
-        return [StudentMonthlyFee.model_validate(r) for r in rows]
-
-    def create(self, actor: CurrentUser, payload: StudentCreate) -> Student:
-        with self.db.transaction() as conn:
-            repo = StudentRepository(conn)
-            self._check_course(conn, payload.course_id)
-            id_no = payload.id_no
-            if id_no is None:
-                prefix = load_academy(conn).student_id_prefix
-                id_no = generate_student_id(prefix, repo.next_sequence_value, repo.id_no_exists)
-            elif repo.id_no_exists(id_no):
-                raise DuplicateStudentError()
-            with translate_constraint_errors(_CONSTRAINTS):
-                inserted = repo.insert(
-                    {
-                        "id_no": id_no,
-                        "name": payload.name,
-                        "guardian_name": payload.guardian_name,
-                        "address": payload.address,
-                        "contact": payload.contact,
-                        "contact_e164": normalize_indian_phone(payload.contact),
-                        "course_id": payload.course_id,
-                        "admission_date": payload.admission_date or local_today(self.timezone),
-                    }
-                )
-            record_audit(
-                conn,
-                actor_id=actor.user_id,
-                action="student.created",
-                entity_type="student",
-                entity_id=inserted["id"],
-                after=inserted,
-            )
-            row = repo.get(inserted["id"])
-        return Student.model_validate(row)
-
-    def update(self, actor: CurrentUser, student_id: UUID, payload: StudentUpdate) -> Student:
-        changes = payload.model_dump(exclude_unset=True)
-        with self.db.transaction() as conn:
-            repo = StudentRepository(conn)
-            current = repo.lock(student_id)
-            if current is None:
-                raise StudentNotFoundError()
-            if "course_id" in changes:
-                self._check_course(conn, changes["course_id"])
-            if "contact" in changes:
-                changes["contact_e164"] = normalize_indian_phone(changes["contact"])
-            if "id_no" in changes:
-                new_id = changes["id_no"]
-                if new_id:
-                    new_id = new_id.strip()
-                    changes["id_no"] = new_id
-                    existing = repo.get_by_id_no(new_id)
-                    if existing and existing["id"] != student_id:
-                        raise DuplicateStudentError("A student with this ID number already exists.")
-                else:
-                    changes["id_no"] = None
-            if "program" in changes and changes["program"] is not None:
-                changes["program"] = changes["program"].strip().upper()
-                if changes["program"] not in ("CERTIFICATE", "NON_CERTIFICATE"):
-                    raise ValidationFailedError("Invalid program type.")
-
-            with translate_constraint_errors(_CONSTRAINTS):
-                updated = repo.update_fields(student_id, changes)
-
-            if "id_no" in changes or "initial_passcode" in changes:
-                user_repo = UserRepository(conn)
-                user_row = conn.execute(
-                    "select user_id from user_profiles where student_id = %s", (student_id,)
-                ).fetchone()
-                if user_row:
-                    user_updates = {}
-                    if changes.get("id_no"):
-                        user_updates["identifier"] = changes["id_no"]
-                    if changes.get("initial_passcode"):
-                        user_updates["password_hash"] = hash_password(changes["initial_passcode"])
-                    if user_updates:
-                        user_repo.update(user_row["user_id"], user_updates)
-
-            record_audit(
-                conn,
-                actor_id=actor.user_id,
-                action="student.updated",
-                entity_type="student",
-                entity_id=student_id,
-                before=current,
-                after=updated,
-            )
-            row = repo.get(student_id)
-        return Student.model_validate(row)
-
-    def notify_due_fee(
-        self,
-        actor: CurrentUser,
-        student_id: UUID,
-        notifications: NotificationService,
-        custom_note: str | None = None,
-    ) -> DueFeeNoticeResult:
-        with self.db.transaction() as conn:
-            repo = StudentRepository(conn)
-            student_row = repo.get(student_id)
-            if student_row is None:
-                raise StudentNotFoundError()
-            academy = load_academy(conn)
-
-        student_name = student_row["name"]
-        id_no = student_row["id_no"] or "Pending"
-        raw_contact = student_row.get("contact") or ""
-        contact_e164 = student_row.get("contact_e164") or normalize_indian_phone(raw_contact)
-        total_due_paise = student_row.get("total_due_paise") or 0
-        unpaid_months = student_row.get("unpaid_months") or []
-        course_name = (
-            student_row.get("course_name") or student_row.get("legacy_course") or "General"
-        )
-
-        if total_due_paise == 0:
-            rate = student_row.get("monthly_fee_paise") or 40000
-            total_due_paise = rate * max(len(unpaid_months), 1)
-
-        amount_formatted = format_inr(total_due_paise)
-        months_str = ", ".join(unpaid_months) if unpaid_months else "Current Session"
-
-        note_part = (
-            f"\nNote: {custom_note.strip()}\n" if custom_note and custom_note.strip() else ""
-        )
-        message_text = (
-            f"Dear {student_name},\n\n"
-            f"This is a gentle fee reminder from {academy.name}.\n\n"
-            f"• Student ID: {id_no}\n"
-            f"• Course: {course_name}\n"
-            f"• Due Period: {months_str}\n"
-            f"• Total Due Amount: {amount_formatted}\n"
-            f"{note_part}\n"
-            f"Kindly clear the fee dues at the academy office or via online payment.\n\n"
-            f"Thank you,\n{academy.name}"
-        )
-
-        clean_phone = ""
-        whatsapp_url = None
-        if contact_e164:
-            clean_phone = contact_e164.lstrip("+")
-            whatsapp_url = f"https://wa.me/{clean_phone}?text={quote_plus(message_text)}"
-
-        notification_id = None
-        queued = False
-        if contact_e164:
-            with self.db.transaction() as conn:
-                notif_repo = NotificationRepository(conn)
-                today_str = local_today(self.timezone).isoformat()
-                enqueued = notif_repo.enqueue(
-                    student_id=student_id,
-                    fee_id=None,
-                    payment_id=None,
-                    channel="WHATSAPP",
-                    recipient=contact_e164,
-                    template=NotificationTemplate.FEE_REMINDER.value,
-                    payload={
-                        "name": student_name,
-                        "fee_title": f"Monthly Dues ({months_str})",
-                        "amount": amount_formatted,
-                        "due_date": "Immediate",
-                        "academy_name": academy.name,
-                    },
-                    dedupe_key=f"manual_fee_notice:{student_id}:{today_str}:{uuid4().hex[:8]}",
-                )
-                if enqueued:
-                    notification_id = enqueued["id"]
-                    queued = True
-                record_audit(
-                    conn,
-                    actor_id=actor.user_id,
-                    action="student.fee_reminder_notified",
-                    entity_type="student",
-                    entity_id=student_id,
-                    after={"recipient": contact_e164, "amount_paise": total_due_paise},
-                )
-            try:
-                notifications.process_due(batch_size=10)
-            except Exception as e:
-                logger.warning("Error processing notification queue: %s", e)
-
-        return DueFeeNoticeResult(
-            student_id=student_id,
-            student_name=student_name,
-            contact=raw_contact,
-            contact_e164=contact_e164,
-            amount_paise=total_due_paise,
-            amount_formatted=amount_formatted,
-            unpaid_months=unpaid_months,
-            message_text=message_text,
-            whatsapp_url=whatsapp_url,
-            queued=queued,
-            notification_id=notification_id,
-        )
-
-    def notify_all_unpaid(
-        self,
-        actor: CurrentUser,
-        notifications: NotificationService,
         *,
-        program: str | None = None,
-        course_id: UUID | None = None,
-        custom_note: str | None = None,
-    ) -> BroadcastDueNoticeResult:
-        with self.db.transaction() as conn:
-            repo = StudentRepository(conn)
-            unpaid_students = repo.get_unpaid_students(program=program, course_id=course_id)
-            academy = load_academy(conn)
+        search: str | None = None,
+        batch: str | None = None,
+        course: str | None = None,
+        fee_status: str | None = None,
+        id_status: str | None = None,
+        month_year: str | None = None,
+    ) -> Page[dict[str, Any]]:
+        resolved_month = get_active_month(month_year)
+        mongo_filter: dict[str, Any] = {}
 
-        total_unpaid = len(unpaid_students)
-        queued_count = 0
-        skipped_no_contact = 0
-        notified: list[DueFeeNoticeResult] = []
-        today_str = local_today(self.timezone).isoformat()
+        course_filter = course or batch
+        if (
+            course_filter
+            and course_filter.strip()
+            and course_filter.strip().upper() != "ALL"
+        ):
+            c_val = course_filter.strip()
+            mongo_filter["$or"] = [{"course": c_val}, {"batch": c_val}]
 
-        for student in unpaid_students:
-            student_id = student["id"]
-            student_name = student["name"]
-            id_no = student["id_no"] or "Pending"
-            raw_contact = student.get("contact") or ""
-            contact_e164 = student.get("contact_e164") or normalize_indian_phone(raw_contact)
-            total_due_paise = student.get("total_due_paise") or 0
-            unpaid_months = student.get("unpaid_months") or []
-            course_name = student.get("course_name") or student.get("legacy_course") or "General"
+        if id_status and id_status.strip().upper() == "MISSING":
+            mongo_filter["student_id"] = {"$in": ["", None]}
+        elif id_status and id_status.strip().upper() == "ASSIGNED":
+            mongo_filter["student_id"] = {"$gt": ""}
 
-            if total_due_paise == 0:
-                rate = student.get("monthly_fee_paise") or 40000
-                total_due_paise = rate * max(len(unpaid_months), 1)
+        if search and search.strip():
+            rx = {"$regex": re.escape(search.strip()), "$options": "i"}
+            search_or = [
+                {"name": rx},
+                {"student_id": rx},
+                {"contact_number": rx},
+                {"course": rx},
+                {"batch": rx},
+                {"password": rx},
+            ]
+            if "$or" in mongo_filter:
+                mongo_filter = {
+                    "$and": [{"$or": mongo_filter.pop("$or")}, {"$or": search_or}],
+                    **mongo_filter,
+                }
+            else:
+                mongo_filter["$or"] = search_or
 
-            amount_formatted = format_inr(total_due_paise)
-            months_str = ", ".join(unpaid_months) if unpaid_months else "Current Session"
-
-            note_part = (
-                f"\nNote: {custom_note.strip()}\n" if custom_note and custom_note.strip() else ""
-            )
-            message_text = (
-                f"Dear {student_name},\n\n"
-                f"This is a gentle fee reminder from {academy.name}.\n\n"
-                f"• Student ID: {id_no}\n"
-                f"• Course: {course_name}\n"
-                f"• Due Period: {months_str}\n"
-                f"• Total Due Amount: {amount_formatted}\n"
-                f"{note_part}\n"
-                f"Kindly clear the fee dues at the academy office or via online payment.\n\n"
-                f"Thank you,\n{academy.name}"
-            )
-
-            if not contact_e164:
-                skipped_no_contact += 1
-                notified.append(
-                    DueFeeNoticeResult(
-                        student_id=student_id,
-                        student_name=student_name,
-                        contact=raw_contact,
-                        contact_e164=None,
-                        amount_paise=total_due_paise,
-                        amount_formatted=amount_formatted,
-                        unpaid_months=unpaid_months,
-                        message_text=message_text,
-                        whatsapp_url=None,
-                        queued=False,
-                    )
-                )
-                continue
-
-            clean_phone = contact_e164.lstrip("+")
-            whatsapp_url = f"https://wa.me/{clean_phone}?text={quote_plus(message_text)}"
-            notif_id = None
-            with self.db.transaction() as conn:
-                notif_repo = NotificationRepository(conn)
-                enqueued = notif_repo.enqueue(
-                    student_id=student_id,
-                    fee_id=None,
-                    payment_id=None,
-                    channel="WHATSAPP",
-                    recipient=contact_e164,
-                    template=NotificationTemplate.FEE_REMINDER.value,
-                    payload={
-                        "name": student_name,
-                        "fee_title": f"Monthly Dues ({months_str})",
-                        "amount": amount_formatted,
-                        "due_date": "Immediate",
-                        "academy_name": academy.name,
-                    },
-                    dedupe_key=f"bulk_fee_notice:{student_id}:{today_str}:{uuid4().hex[:8]}",
-                )
-                if enqueued:
-                    notif_id = enqueued["id"]
-                    queued_count += 1
-                record_audit(
-                    conn,
-                    actor_id=actor.user_id,
-                    action="notifications.bulk_due_reminder",
-                    entity_type="student",
-                    entity_id=student_id,
-                    after={"recipient": contact_e164, "amount_paise": total_due_paise},
-                )
-
-            notified.append(
-                DueFeeNoticeResult(
-                    student_id=student_id,
-                    student_name=student_name,
-                    contact=raw_contact,
-                    contact_e164=contact_e164,
-                    amount_paise=total_due_paise,
-                    amount_formatted=amount_formatted,
-                    unpaid_months=unpaid_months,
-                    message_text=message_text,
-                    whatsapp_url=whatsapp_url,
-                    queued=True,
-                    notification_id=notif_id,
+        if fee_status and fee_status.strip().upper() in (
+            "PAID",
+            "UNPAID",
+            "PENDING",
+            "DUE",
+        ):
+            paid_docs = list(
+                self._db["fee_payments"].find(
+                    {"month_year": resolved_month, "status": "PAID"},
+                    {"student_key": 1, "student_id": 1, "_id": 0},
                 )
             )
+            paid_keys = [d["student_key"] for d in paid_docs if d.get("student_key")]
+            paid_codes = [d["student_id"] for d in paid_docs if d.get("student_id")]
+
+            if fee_status.strip().upper() == "PAID":
+                paid_cond = {
+                    "$or": [
+                        {"id": {"$in": paid_keys}},
+                        *(
+                            [{"student_id": {"$in": paid_codes}}]
+                            if paid_codes
+                            else []
+                        ),
+                    ]
+                }
+                mongo_filter = (
+                    {"$and": [mongo_filter, paid_cond]} if mongo_filter else paid_cond
+                )
+            else:
+                unpaid_cond: dict[str, Any] = {"id": {"$nin": paid_keys}}
+                if paid_codes:
+                    unpaid_cond["student_id"] = {"$nin": paid_codes}
+                mongo_filter = (
+                    {"$and": [mongo_filter, unpaid_cond]}
+                    if mongo_filter
+                    else unpaid_cond
+                )
+
+        total = self._db["students"].count_documents(mongo_filter)
+        rows = list(
+            self._db["students"]
+            .find(mongo_filter)
+            .sort([("name", ASCENDING)])
+            .skip(params.offset)
+            .limit(params.limit)
+        )
+
+        student_keys = [str(r["id"]) for r in rows]
+        student_codes = [r["student_id"] for r in rows if r.get("student_id")]
+        active_payments_by_key: dict[str, dict[str, Any]] = {}
+        active_payments_by_code: dict[str, dict[str, Any]] = {}
+
+        if student_keys or student_codes:
+            or_q: list[dict[str, Any]] = [{"student_key": {"$in": student_keys}}]
+            if student_codes:
+                or_q.append({"student_id": {"$in": student_codes}})
+            for fp in self._db["fee_payments"].find(
+                {"month_year": resolved_month, "$or": or_q}
+            ):
+                if fp.get("student_key"):
+                    active_payments_by_key[fp["student_key"]] = fp
+                if fp.get("student_id"):
+                    active_payments_by_code[fp["student_id"]] = fp
+
+        items: list[dict[str, Any]] = []
+        for r in rows:
+            s_uuid = str(r["id"])
+            code = r.get("student_id") or ""
+            contact = r.get("contact_number") or ""
+            course_val = r.get("course") or r.get("batch") or "GENERAL"
+            monthly_fee = Decimal(str(r.get("monthly_fee", 600))).quantize(
+                Decimal("0.01")
+            )
+            pwd = r.get("password") or generate_student_passcode(
+                r["name"], code, contact
+            )
+            created_at = r.get("created_at")
+            fp = active_payments_by_key.get(s_uuid) or (
+                active_payments_by_code.get(code) if code else None
+            )
+            p_date = fp.get("payment_date") if fp else None
+            status_str = "PAID" if (fp and fp.get("status") == "PAID") else "UNPAID"
+
+            items.append(
+                {
+                    "id": s_uuid,
+                    "name": r["name"],
+                    "full_name": r["name"],
+                    "student_id": code,
+                    "enrollment_number": code,
+                    "has_student_id": bool(code),
+                    "password": pwd,
+                    "initial_passcode": pwd,
+                    "contact_number": contact,
+                    "phone": contact,
+                    "course": course_val,
+                    "batch": course_val,
+                    "batch_name": course_val,
+                    "monthly_fee": float(monthly_fee),
+                    "monthly_fee_paise": int(monthly_fee * 100),
+                    "fee_status": status_str,
+                    "current_month_status": status_str,
+                    "month": resolved_month,
+                    "current_month": resolved_month,
+                    "month_label": format_month_label(resolved_month),
+                    "photo_url": r.get("photo_url"),
+                    "created_at": (
+                        created_at.isoformat()
+                        if isinstance(created_at, datetime)
+                        else str(created_at or "")
+                    ),
+                    "active": True,
+                    "active_payment_date": (
+                        p_date.isoformat() if isinstance(p_date, datetime) else p_date
+                    ),
+                    "active_razorpay_payment_id": (
+                        fp.get("razorpay_payment_id") if fp else None
+                    ),
+                }
+            )
+
+        return Page.of(items, total, params)
+
+    def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        name = str(payload.get("name") or payload.get("full_name") or "").strip()
+        if not name:
+            raise ValidationError("Student name is required.")
+
+        student_id = (
+            str(payload.get("student_id") or payload.get("enrollment_number") or "")
+            .strip()
+            .upper()
+        )
+        contact = str(
+            payload.get("contact_number") or payload.get("phone") or ""
+        ).strip()
+        course = (
+            str(payload.get("course") or payload.get("batch") or "GENERAL")
+            .strip()
+            .upper()
+        )
+        raw_fee = payload.get("monthly_fee", 600)
+        monthly_fee = float(Decimal(str(raw_fee)).quantize(Decimal("0.01")))
+        raw_password = str(payload.get("password") or "").strip()
+        password = (
+            raw_password
+            if raw_password
+            else generate_student_passcode(name, student_id, contact)
+        )
+        active_month = get_active_month(payload.get("month"))
+        fee_status = str(payload.get("fee_status") or "UNPAID").strip().upper()
+        if fee_status not in ("PAID", "UNPAID"):
+            fee_status = "UNPAID"
+
+        if student_id:
+            dup = self._db["students"].find_one({"student_id": student_id})
+            if dup:
+                raise ConflictError(
+                    f"Student ID '{student_id}' is already assigned to {dup['name']}."
+                )
+
+        new_uuid = str(uuid4())
+        doc = {
+            "id": new_uuid,
+            "name": name,
+            "student_id": student_id,
+            "password": password,
+            "contact_number": contact,
+            "course": course,
+            "batch": course,
+            "monthly_fee": monthly_fee,
+            "fee_status": fee_status,
+            "month": active_month,
+            "photo_url": None,
+            "created_at": datetime.now(tz=UTC),
+        }
+        self._db["students"].insert_one(doc)
+
+        if fee_status == "PAID":
+            self._set_month_payment_status(
+                student_uuid_str=new_uuid,
+                student_id_code=student_id,
+                month_year=active_month,
+                status="PAID",
+                amount=monthly_fee,
+            )
+
+        return self._build_student_payload(
+            doc, include_payments=True, active_month=active_month
+        )
+
+    def update(
+        self, student_identifier: str | UUID, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        existing = self._fetch_raw_student(student_identifier)
+        student_uuid_str = str(existing["id"])
+        old_student_id = existing.get("student_id") or ""
+
+        name = str(
+            payload.get("name") or payload.get("full_name") or existing["name"]
+        ).strip()
+
+        if "student_id" in payload or "enrollment_number" in payload:
+            raw_new_id = (
+                payload.get("student_id")
+                if "student_id" in payload
+                else payload.get("enrollment_number")
+            )
+            new_student_id = str(raw_new_id or "").strip().upper()
+        else:
+            new_student_id = old_student_id
+
+        if new_student_id and new_student_id != old_student_id:
+            dup = self._db["students"].find_one(
+                {"student_id": new_student_id, "id": {"$ne": student_uuid_str}}
+            )
+            if dup:
+                raise ConflictError(
+                    f"Student ID '{new_student_id}' is already assigned to {dup['name']}."
+                )
+
+        if "contact_number" in payload or "phone" in payload:
+            raw_contact = (
+                payload.get("contact_number")
+                if "contact_number" in payload
+                else payload.get("phone")
+            )
+            contact = str(raw_contact or "").strip()
+        else:
+            contact = existing.get("contact_number") or ""
+
+        if "course" in payload or "batch" in payload:
+            raw_course = (
+                payload.get("course")
+                if "course" in payload
+                else payload.get("batch")
+            )
+            course = str(raw_course or "GENERAL").strip().upper()
+        else:
+            course = existing.get("course") or existing.get("batch") or "GENERAL"
+
+        raw_fee = payload.get("monthly_fee", existing.get("monthly_fee", 600))
+        monthly_fee = float(Decimal(str(raw_fee)).quantize(Decimal("0.01")))
+
+        # Password resolution: if Admin explicitly changed password, use it;
+        # if Admin assigned a new student_id and didn't change password, auto-derive from new student_id
+        existing_pwd = existing.get("password") or ""
+        if "password" in payload and str(payload.get("password") or "").strip():
+            req_pwd = str(payload["password"]).strip()
+            if (
+                req_pwd == existing_pwd
+                and new_student_id
+                and new_student_id != old_student_id
+            ):
+                password = generate_student_passcode(name, new_student_id, contact)
+            else:
+                password = req_pwd
+        elif new_student_id and new_student_id != old_student_id:
+            password = generate_student_passcode(name, new_student_id, contact)
+        else:
+            password = existing_pwd or generate_student_passcode(
+                name, new_student_id, contact
+            )
+
+        active_month = get_active_month(payload.get("month"))
 
         try:
-            notifications.process_due(batch_size=max(queued_count, 50))
-        except Exception as e:
-            logger.warning("Error processing notification queue in bulk run: %s", e)
+            row = self._db["students"].find_one_and_update(
+                {"id": student_uuid_str},
+                {
+                    "$set": {
+                        "name": name,
+                        "student_id": new_student_id,
+                        "password": password,
+                        "contact_number": contact,
+                        "course": course,
+                        "batch": course,
+                        "monthly_fee": monthly_fee,
+                        "month": active_month,
+                    }
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+        except DuplicateKeyError as exc:
+            raise ConflictError(
+                f"Student ID '{new_student_id}' is already in use."
+            ) from exc
 
-        status_msg = (
-            f"Queued WhatsApp fee notices for {queued_count} students "
-            f"({skipped_no_contact} skipped without phone number)."
-        )
-        return BroadcastDueNoticeResult(
-            total_unpaid=total_unpaid,
-            queued_count=queued_count,
-            skipped_no_contact=skipped_no_contact,
-            message=status_msg,
-            notified_students=notified,
+        # Cascade student_id update to fee_payments if student_id changed
+        if new_student_id != old_student_id:
+            self._db["fee_payments"].update_many(
+                {
+                    "$or": [
+                        {"student_key": student_uuid_str},
+                        *(
+                            [{"student_id": old_student_id}]
+                            if old_student_id
+                            else []
+                        ),
+                    ]
+                },
+                {
+                    "$set": {
+                        "student_key": student_uuid_str,
+                        "student_id": new_student_id,
+                    }
+                },
+            )
+
+        # If fee_status was included in the update payload, sync active month payment status
+        if "fee_status" in payload and payload["fee_status"] is not None:
+            self._set_month_payment_status(
+                student_uuid_str=student_uuid_str,
+                student_id_code=new_student_id,
+                month_year=active_month,
+                status=str(payload["fee_status"]),
+                amount=monthly_fee,
+            )
+
+        return self._build_student_payload(
+            dict(row), include_payments=True, active_month=active_month
         )
 
-    def set_status(self, actor: CurrentUser, student_id: UUID, status: StudentStatus) -> Student:
-        return self.update(actor, student_id, StudentUpdate(status=status))
+    def delete(self, student_identifier: str | UUID) -> dict[str, Any]:
+        existing = self._fetch_raw_student(student_identifier)
+        s_uuid = str(existing["id"])
+        code = existing.get("student_id") or ""
+        self._db["students"].delete_one({"id": s_uuid})
+        self._db["fee_payments"].delete_many(
+            {
+                "$or": [
+                    {"student_key": s_uuid},
+                    *([{"student_id": code}] if code else []),
+                ]
+            }
+        )
+        return {"deleted": True, "id": s_uuid, "student_id": code}
 
     def upload_photo(
         self,
         actor: CurrentUser,
-        student_id: UUID,
+        student_identifier: str | UUID,
         *,
-        data: bytes,
-        filename: str | None,
+        filename: str,
         content_type: str | None,
-    ) -> StudentPhotoResult:
-        image = validate_image(data, filename, content_type)
-        with self.db.transaction() as conn:
-            if StudentRepository(conn).get_by_id(student_id) is None:
-                raise StudentNotFoundError()
-
-        # Photos are never overwritten: each upload gets a new path and the old file is kept.
-        path = f"{student_id}/{uuid4().hex}.jpg"
-        self.storage.upload(self.storage.photo_bucket, path, image.data, image.content_type)
-
-        with self.db.transaction() as conn:
-            repo = StudentRepository(conn)
-            current = repo.lock(student_id)
-            if current is None:
-                raise StudentNotFoundError()
-            repo.update_fields(student_id, {"photo_path": path})
-            record_audit(
-                conn,
-                actor_id=actor.user_id,
-                action="student.photo_updated",
-                entity_type="student",
-                entity_id=student_id,
-                before={"photo_path": current["photo_path"]},
-                after={"photo_path": path},
-            )
-
-        generated, error = True, None
-        try:
-            self.id_cards.generate(actor, student_id)
-        except AppError as exc:
-            generated, error = False, exc.message
-            logger.warning(
-                "id card generation after photo upload failed",
-                extra={"student_id": str(student_id), "code": exc.code},
-            )
-        return StudentPhotoResult(
-            student=self.get(actor, student_id), id_card_generated=generated, id_card_error=error
+        data: bytes,
+    ) -> dict[str, Any]:
+        row = self._fetch_raw_student(student_identifier)
+        assert_student_self_or_staff(
+            actor,
+            student_uuid=UUID(str(row["id"])),
+            student_id_code=row.get("student_id"),
         )
+        normalized_jpeg = _validate_and_normalize_photo(data, content_type)
+        ref_id = row.get("student_id") or str(row["id"])
+        safe_code = re.sub(r"[^A-Za-z0-9_-]", "_", ref_id)
+        storage_key = f"{safe_code}.jpg"
 
-    def get_photo(self, user: CurrentUser, student_id: UUID) -> bytes:
-        student = self.get(user, student_id)
-        if student.photo_path is None:
-            raise NotFoundError("No photo has been uploaded.", code="PHOTO_NOT_FOUND")
-        return self.storage.download(self.storage.photo_bucket, student.photo_path)
+        if self._storage is not None:
+            self._storage.put(
+                bucket="student-photos",
+                key=storage_key,
+                data=normalized_jpeg,
+                content_type="image/jpeg",
+            )
 
-    @staticmethod
-    def _check_course(conn: DbConnection, course_id: UUID | None) -> None:
-        if course_id is None:
-            return
-        course = CourseRepository(conn).get_by_id(course_id)
-        if course is None:
-            raise NotFoundError("Course was not found.", code="COURSE_NOT_FOUND")
-        if not course["active"]:
-            raise ValidationFailedError("This course is inactive.", code="COURSE_INACTIVE")
+        photo_url = f"/api/v1/students/{ref_id}/photo?v={int(time.time())}"
+        updated = self._db["students"].find_one_and_update(
+            {"id": str(row["id"])},
+            {"$set": {"photo_url": photo_url}},
+            return_document=ReturnDocument.AFTER,
+        )
+        return self._build_student_payload(dict(updated), include_payments=True)
+
+    def get_photo_bytes(self, student_identifier: str | UUID) -> tuple[bytes, str]:
+        row = self._fetch_raw_student(student_identifier)
+        ref_id = row.get("student_id") or str(row["id"])
+        safe_code = re.sub(r"[^A-Za-z0-9_-]", "_", ref_id)
+        storage_key = f"{safe_code}.jpg"
+
+        if self._storage is not None:
+            try:
+                raw_bytes = self._storage.get(bucket="student-photos", key=storage_key)
+                return raw_bytes, "image/jpeg"
+            except Exception:
+                pass
+
+        return (
+            _render_fallback_avatar(row["name"], row.get("student_id") or ""),
+            "image/png",
+        )

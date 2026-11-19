@@ -1,247 +1,272 @@
-"""Authentication (Supabase Auth) and application account management."""
+"""Authentication service for the strict 3-collection MongoDB Atlas schema (`admins` and `students`).
 
+Supports:
+1. Admin Login via `username` (e.g. `BWADMIN`) + bcrypt `password_hash` (`role = SUPER_ADMIN`).
+2. Student Login via `student_id` (e.g. `RG240017`) + stored `password` (or derived passcode / registered `contact_number`).
+"""
+
+import re
 from typing import Any
 from uuid import UUID
 
-from app.core.constants import Role
-from app.core.permissions import CurrentUser
-from app.core.security import TokenClaims
-from app.db.client import Database
-from app.db.transactions import translate_constraint_errors
-from app.exceptions import (
-    ConflictError,
-    ForbiddenError,
-    InvalidStateError,
-    NotFoundError,
-    StudentNotFoundError,
-    UnauthorizedError,
+from pymongo.database import Database as MongoDatabase
+
+from app.config import Settings
+from app.core.constants import Role, get_active_month
+from app.core.errors import AuthenticationError, ValidationError
+from app.core.jwt_signer import (
+    ACCESS_TOKEN_TTL_SECONDS,
+    create_access_token,
+    decode_local_token,
 )
-from app.integrations.supabase_auth import SupabaseAuthClient
-from app.models.user import UserProfile
-from app.repositories.student_repository import StudentRepository
-from app.repositories.teacher_repository import TeacherRepository
-from app.repositories.user_repository import UserRepository
-from app.schemas.auth import (
-    InviteUserRequest,
-    LinkUserRequest,
-    MeOut,
-    TokenOut,
-    UpdateUserRequest,
+from app.core.passwords import (
+    hash_password,
+    verify_password,
+    verify_student_credential,
 )
-from app.services.audit_service import record_audit
-from app.utils.pagination import Page, PageParams
+from app.core.security import CurrentUser
+from app.schemas.auth import MeOut, TokenOut
 
-_PROFILE_CONSTRAINTS = {
-    "user_profiles_pkey": lambda: ConflictError(
-        "This account is already linked.", code="ACCOUNT_ALREADY_LINKED"
-    ),
-    "user_profiles_student_id_key": lambda: ConflictError(
-        "This student already has a login account.", code="STUDENT_ACCOUNT_EXISTS"
-    ),
-    "user_profiles_teacher_id_key": lambda: ConflictError(
-        "This teacher already has a login account.", code="TEACHER_ACCOUNT_EXISTS"
-    ),
-}
-
-
-def _token_out(data: dict[str, Any]) -> TokenOut:
-    return TokenOut(
-        access_token=data["access_token"],
-        refresh_token=data["refresh_token"],
-        token_type=data.get("token_type", "bearer"),
-        expires_in=int(data.get("expires_in", 3600)),
-        user_id=UUID(data["user"]["id"]),
-    )
+ADMIN_EMAIL_ALIASES = {"admin@brightway.local": "BWADMIN"}
 
 
 class AuthService:
-    def __init__(self, db: Database, auth_client: SupabaseAuthClient) -> None:
-        self.db = db
-        self.auth_client = auth_client
-
-    # ------------------------------------------------------------------ session
-    def load_current_user(self, claims: TokenClaims) -> CurrentUser:
-        with self.db.transaction() as conn:
-            row = UserRepository(conn).get(claims.user_id)
-        if row is None:
-            raise ForbiddenError(
-                "Your account is not set up yet. Please contact the academy.",
-                code="ACCOUNT_NOT_PROVISIONED",
-            )
-        if not row["active"]:
-            raise ForbiddenError("Your account has been disabled.", code="ACCOUNT_DISABLED")
-        return CurrentUser(
-            user_id=row["user_id"],
-            role=Role(row["role"]),
-            email=row["email"] or claims.email,
-            student_id=row["student_id"],
-            teacher_id=row["teacher_id"],
-        )
+    def __init__(
+        self, conn: MongoDatabase[dict[str, Any]], settings: Settings
+    ) -> None:
+        self._db = conn
+        self._settings = settings
 
     def login(self, identifier: str, password: str) -> TokenOut:
-        from app.core.jwt_signer import issue_token
-        from app.core.passwords import verify_password
-
-        identifier = identifier.strip()
-        with self.db.transaction() as conn:
-            user = UserRepository(conn).find_by_identifier(identifier)
-
-        if user is not None and user.get("password_hash"):
-            if not verify_password(password, user["password_hash"]):
-                raise UnauthorizedError("Invalid ID or passcode.", code="INVALID_CREDENTIALS")
-            if not user["active"]:
-                raise ForbiddenError("Your account has been disabled.", code="ACCOUNT_DISABLED")
-            return issue_token(user["user_id"], email=user.get("email"))
-
-        try:
-            return _token_out(self.auth_client.sign_in_with_password(identifier, password))
-        except UnauthorizedError:
-            raise
-        except Exception:
-            raise UnauthorizedError(
-                "Invalid ID, email, or passcode.", code="INVALID_CREDENTIALS"
+        clean_id = identifier.strip()
+        if not clean_id or not password:
+            raise AuthenticationError(
+                "Student ID / Username and password are required."
             )
+
+        alias_id = ADMIN_EMAIL_ALIASES.get(clean_id.lower(), clean_id)
+
+        # 1. Check `admins` collection first
+        admin_row = self._db["admins"].find_one(
+            {"username": {"$regex": f"^{re.escape(alias_id)}$", "$options": "i"}}
+        )
+
+        if admin_row is not None:
+            if not verify_password(password, admin_row["password_hash"]):
+                raise AuthenticationError("Invalid administrator credentials.")
+
+            role = Role(admin_row["role"])
+            admin_uuid = UUID(str(admin_row["id"]))
+            access_token = create_access_token(
+                self._settings,
+                user_id=admin_uuid,
+                role=role.value,
+                identifier=admin_row["username"],
+            )
+            me = MeOut(
+                user_id=admin_uuid,
+                email=None,
+                role=role,
+                student_id=None,
+                student_code=None,
+                display_name="Brightway Super Admin",
+                month=get_active_month(),
+            )
+            return TokenOut(
+                access_token=access_token,
+                refresh_token=access_token,
+                token_type="bearer",  # noqa: S106
+                expires_in=ACCESS_TOKEN_TTL_SECONDS,
+                user_id=admin_uuid,
+                user=me,
+            )
+
+        # 2. Check `students` collection by `student_id`
+        student_row = self._db["students"].find_one(
+            {"student_id": clean_id.upper()}
+        ) or self._db["students"].find_one(
+            {"student_id": {"$regex": f"^{re.escape(clean_id)}$", "$options": "i"}}
+        )
+
+        if student_row is None or not student_row.get("student_id"):
+            raise AuthenticationError(
+                "Invalid Student ID or credentials. Please check your Student ID and Password."
+            )
+
+        if not verify_student_credential(
+            name=student_row["name"],
+            student_id=student_row["student_id"],
+            contact_number=student_row.get("contact_number", ""),
+            supplied_secret=password,
+            stored_password=student_row.get("password"),
+        ):
+            raise AuthenticationError(
+                "Invalid Password or Contact Number for this Student ID."
+            )
+
+        student_uuid = UUID(str(student_row["id"]))
+        active_month = get_active_month()
+        course = student_row.get("course") or student_row.get("batch") or "GENERAL"
+
+        # Check active month payment status
+        fp = self._db["fee_payments"].find_one(
+            {
+                "$or": [
+                    {"student_key": str(student_uuid), "month_year": active_month},
+                    {"student_id": student_row["student_id"], "month_year": active_month},
+                ]
+            }
+        )
+        fee_status = "PAID" if (fp and fp.get("status") == "PAID") else "UNPAID"
+
+        access_token = create_access_token(
+            self._settings,
+            user_id=student_uuid,
+            role=Role.STUDENT.value,
+            identifier=student_row["student_id"],
+        )
+        me = MeOut(
+            user_id=student_uuid,
+            email=None,
+            role=Role.STUDENT,
+            student_id=student_uuid,
+            student_code=student_row["student_id"],
+            display_name=student_row["name"],
+            contact_number=student_row.get("contact_number", ""),
+            course=course,
+            batch=course,
+            monthly_fee=float(student_row.get("monthly_fee", 600)),
+            fee_status=fee_status,
+            month=active_month,
+            photo_url=student_row.get("photo_url"),
+        )
+        return TokenOut(
+            access_token=access_token,
+            refresh_token=access_token,
+            token_type="bearer",  # noqa: S106
+            expires_in=ACCESS_TOKEN_TTL_SECONDS,
+            user_id=student_uuid,
+            user=me,
+        )
 
     def refresh(self, refresh_token: str) -> TokenOut:
-        if refresh_token.startswith("ref_"):
-            parts = refresh_token.split("_")
-            if len(parts) == 3:
-                try:
-                    user_id = UUID(parts[2])
-                    with self.db.transaction() as conn:
-                        user = UserRepository(conn).get(user_id)
-                    if user and user["active"]:
-                        from app.core.jwt_signer import issue_token
+        claims = decode_local_token(self._settings, refresh_token)
+        if not claims:
+            raise AuthenticationError("Session expired. Please sign in again.")
 
-                        return issue_token(user["user_id"], email=user.get("email"))
-                except Exception:
-                    pass
-        try:
-            return _token_out(self.auth_client.refresh_session(refresh_token))
-        except Exception:
-            raise UnauthorizedError(
-                "Session is no longer valid. Please sign in again.", code="INVALID_REFRESH_TOKEN"
+        role_str = str(claims.get("role", Role.STUDENT.value))
+        identifier = str(claims.get("identifier", ""))
+
+        if role_str in (Role.SUPER_ADMIN.value, Role.ADMIN.value):
+            admin_row = self._db["admins"].find_one(
+                {"username": {"$regex": f"^{re.escape(identifier)}$", "$options": "i"}}
             )
+            if not admin_row:
+                raise AuthenticationError("Administrator session is no longer valid.")
+            admin_uuid = UUID(str(admin_row["id"]))
+            new_token = create_access_token(
+                self._settings,
+                user_id=admin_uuid,
+                role=admin_row["role"],
+                identifier=admin_row["username"],
+            )
+            return TokenOut(
+                access_token=new_token,
+                refresh_token=new_token,
+                token_type="bearer",  # noqa: S106
+                expires_in=ACCESS_TOKEN_TTL_SECONDS,
+                user_id=admin_uuid,
+            )
+
+        student_row = self._db["students"].find_one(
+            {"student_id": identifier.strip().upper()}
+        )
+        if not student_row:
+            raise AuthenticationError("Student session is no longer valid.")
+
+        student_uuid = UUID(str(student_row["id"]))
+        new_token = create_access_token(
+            self._settings,
+            user_id=student_uuid,
+            role=Role.STUDENT.value,
+            identifier=student_row["student_id"],
+        )
+        return TokenOut(
+            access_token=new_token,
+            refresh_token=new_token,
+            token_type="bearer",  # noqa: S106
+            expires_in=ACCESS_TOKEN_TTL_SECONDS,
+            user_id=student_uuid,
+        )
 
     def me(self, user: CurrentUser) -> MeOut:
-        with self.db.transaction() as conn:
-            name = UserRepository(conn).display_name(user.student_id, user.teacher_id)
+        active_month = get_active_month()
+        if user.is_admin:
+            return MeOut(
+                user_id=user.id,
+                email=None,
+                role=user.role,
+                student_id=None,
+                student_code=user.identifier,
+                display_name=user.full_name or "Brightway Super Admin",
+                month=active_month,
+            )
+
+        row = self._db["students"].find_one({"id": str(user.id)})
+        if not row and user.student_id:
+            row = self._db["students"].find_one({"student_id": user.student_id.upper()})
+        if not row:
+            return MeOut(
+                user_id=user.id,
+                email=None,
+                role=user.role,
+                student_id=user.id,
+                student_code=user.student_id,
+                display_name=user.full_name,
+                contact_number=user.phone,
+                month=active_month,
+            )
+
+        student_uuid = UUID(str(row["id"]))
+        course = row.get("course") or row.get("batch") or "GENERAL"
+        fp = self._db["fee_payments"].find_one(
+            {
+                "$or": [
+                    {"student_key": str(student_uuid), "month_year": active_month},
+                    {"student_id": row.get("student_id"), "month_year": active_month},
+                ]
+            }
+        )
+        fee_status = "PAID" if (fp and fp.get("status") == "PAID") else "UNPAID"
+
         return MeOut(
-            user_id=user.user_id,
-            email=user.email,
-            role=user.role,
-            student_id=user.student_id,
-            teacher_id=user.teacher_id,
-            display_name=name,
+            user_id=student_uuid,
+            email=None,
+            role=Role.STUDENT,
+            student_id=student_uuid,
+            student_code=row.get("student_id"),
+            display_name=row["name"],
+            contact_number=row.get("contact_number", ""),
+            course=course,
+            batch=course,
+            monthly_fee=float(row.get("monthly_fee", 600)),
+            fee_status=fee_status,
+            month=active_month,
+            photo_url=row.get("photo_url"),
         )
 
-    # ------------------------------------------------------------------ account management
-    def list_users(
-        self, *, role: Role | None, active: bool | None, params: PageParams
-    ) -> Page[UserProfile]:
-        with self.db.transaction() as conn:
-            rows, total = UserRepository(conn).search(
-                role=role.value if role else None,
-                active=active,
-                limit=params.limit,
-                offset=params.offset,
-            )
-        return Page([UserProfile.model_validate(r) for r in rows], total, params)
-
-    def link_user(self, actor: CurrentUser, payload: LinkUserRequest) -> UserProfile:
-        with self.db.transaction() as conn:
-            users = UserRepository(conn)
-            user_id = payload.user_id
-            if user_id is None and payload.email:
-                user_id = users.find_auth_user_id(payload.email)
-                if user_id is None:
-                    raise NotFoundError(
-                        "No Supabase Auth user exists with this email.", code="AUTH_USER_NOT_FOUND"
-                    )
-            if user_id is None:
-                raise NotFoundError("User was not found.", code="AUTH_USER_NOT_FOUND")
-            if users.get(user_id) is not None:
-                raise ConflictError(
-                    "This account is already linked.", code="ACCOUNT_ALREADY_LINKED"
-                )
-            self._check_link_targets(conn, payload.student_id, payload.teacher_id)
-            with translate_constraint_errors(_PROFILE_CONSTRAINTS):
-                row = users.insert(
-                    {
-                        "user_id": user_id,
-                        "email": payload.email,
-                        "role": payload.role.value,
-                        "student_id": payload.student_id,
-                        "teacher_id": payload.teacher_id,
-                    }
-                )
-            record_audit(
-                conn,
-                actor_id=actor.user_id,
-                action="user.linked",
-                entity_type="user_profile",
-                entity_id=user_id,
-                after=row,
-            )
-        return UserProfile.model_validate(row)
-
-    def invite_user(self, actor: CurrentUser, payload: InviteUserRequest) -> UserProfile:
-        with self.db.transaction() as conn:
-            self._check_link_targets(conn, payload.student_id, payload.teacher_id)
-        user_id = self.auth_client.invite_user(payload.email)
-        return self.link_user(
-            actor,
-            LinkUserRequest(
-                user_id=user_id,
-                email=payload.email,
-                role=payload.role,
-                student_id=payload.student_id,
-                teacher_id=payload.teacher_id,
-            ),
+    def change_admin_password(
+        self, user: CurrentUser, current_password: str, new_password: str
+    ) -> dict[str, bool]:
+        if not user.is_admin:
+            raise ValidationError("Only administrators can change their password.")
+        admin_row = self._db["admins"].find_one({"id": str(user.id)})
+        if not admin_row or not verify_password(
+            current_password, admin_row["password_hash"]
+        ):
+            raise AuthenticationError("Current administrator password is incorrect.")
+        new_hash = hash_password(new_password)
+        self._db["admins"].update_one(
+            {"id": str(user.id)}, {"$set": {"password_hash": new_hash}}
         )
-
-    def update_user(
-        self, actor: CurrentUser, user_id: UUID, payload: UpdateUserRequest
-    ) -> UserProfile:
-        with self.db.transaction() as conn:
-            users = UserRepository(conn)
-            current = users.get(user_id, for_update=True)
-            if current is None:
-                raise NotFoundError("User account was not found.", code="USER_NOT_FOUND")
-            changes: dict[str, Any] = {}
-            if payload.active is not None:
-                changes["active"] = payload.active
-            if payload.role is not None:
-                self._check_link_targets(conn, payload.student_id, payload.teacher_id)
-                changes.update(
-                    role=payload.role.value,
-                    student_id=payload.student_id,
-                    teacher_id=payload.teacher_id,
-                )
-            removes_admin = current["role"] == Role.ADMIN and (
-                changes.get("active") is False
-                or changes.get("role", Role.ADMIN.value) != Role.ADMIN.value
-            )
-            if removes_admin and user_id == actor.user_id:
-                raise InvalidStateError("You cannot disable or demote your own account.")
-            if removes_admin and current["active"] and users.count_active_admins() <= 1:
-                raise InvalidStateError("At least one active admin account is required.")
-            with translate_constraint_errors(_PROFILE_CONSTRAINTS):
-                row = users.update(user_id, changes)
-            record_audit(
-                conn,
-                actor_id=actor.user_id,
-                action="user.updated",
-                entity_type="user_profile",
-                entity_id=user_id,
-                before=current,
-                after=row,
-            )
-        return UserProfile.model_validate(row)
-
-    @staticmethod
-    def _check_link_targets(conn: Any, student_id: UUID | None, teacher_id: UUID | None) -> None:
-        if student_id is not None and StudentRepository(conn).get_by_id(student_id) is None:
-            raise StudentNotFoundError()
-        if teacher_id is not None and TeacherRepository(conn).get_by_id(teacher_id) is None:
-            raise NotFoundError("Teacher was not found.", code="TEACHER_NOT_FOUND")
+        return {"changed": True}

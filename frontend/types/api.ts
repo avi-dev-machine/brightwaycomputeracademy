@@ -49,7 +49,7 @@ export interface PageParams {
 
 /* --------------------------------------------------------------------- auth */
 
-export type Role = "ADMIN" | "TEACHER" | "STUDENT";
+export type Role = "SUPER_ADMIN" | "ADMIN" | "TEACHER" | "STUDENT";
 
 export interface TokenOut {
   access_token: string;
@@ -57,6 +57,7 @@ export interface TokenOut {
   token_type?: string;
   expires_in: number;
   user_id: UUID;
+  user?: MeOut | null;
 }
 
 export interface MeOut {
@@ -64,8 +65,13 @@ export interface MeOut {
   email: string | null;
   role: Role;
   student_id: UUID | null;
+  student_code?: string | null;
   teacher_id: UUID | null;
   display_name: string | null;
+  contact_number?: string | null;
+  batch?: string | null;
+  monthly_fee?: number | null;
+  photo_url?: string | null;
 }
 
 export interface LoginRequest {

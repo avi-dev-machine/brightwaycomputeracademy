@@ -1,108 +1,83 @@
-"""Application-specific exceptions. Each maps to a stable error code and HTTP status."""
+"""Domain and HTTP exceptions with stable machine-readable error codes."""
 
 from typing import Any
 
 
 class AppError(Exception):
-    status_code: int = 400
-    code: str = "APP_ERROR"
-    message: str = "The request could not be processed."
+    status_code: int = 500
+    code: str = "INTERNAL_ERROR"
 
     def __init__(
         self,
-        message: str | None = None,
+        message: str,
         *,
         code: str | None = None,
+        status_code: int | None = None,
         details: Any = None,
         headers: dict[str, str] | None = None,
     ) -> None:
-        self.message = message or self.message
-        self.code = code or self.code
+        super().__init__(message)
+        self.message = message
+        if code is not None:
+            self.code = code
+        if status_code is not None:
+            self.status_code = status_code
         self.details = details
         self.headers = headers
-        super().__init__(self.message)
+
+
+class AuthenticationError(AppError):
+    status_code = 401
+    code = "UNAUTHENTICATED"
+
+
+class AuthorizationError(AppError):
+    status_code = 403
+    code = "FORBIDDEN"
 
 
 class NotFoundError(AppError):
     status_code = 404
     code = "NOT_FOUND"
-    message = "The requested resource was not found."
 
-
-class StudentNotFoundError(NotFoundError):
-    code = "STUDENT_NOT_FOUND"
-    message = "Student was not found."
+    def __init__(self, resource: str, identifier: Any = None) -> None:
+        msg = f"{resource} was not found." if identifier is None else f"{resource} '{identifier}' was not found."
+        super().__init__(msg, details={"resource": resource})
 
 
 class ConflictError(AppError):
     status_code = 409
     code = "CONFLICT"
-    message = "The request conflicts with existing data."
 
 
-class DuplicateStudentError(ConflictError):
-    code = "DUPLICATE_STUDENT"
-    message = "A student with this ID No. already exists."
-
-
-class InvalidStateError(ConflictError):
-    code = "INVALID_STATE"
-    message = "This action is not allowed in the current state."
-
-
-class ValidationFailedError(AppError):
+class DomainValidationError(AppError):
     status_code = 422
     code = "VALIDATION_ERROR"
-    message = "The request contains invalid data."
 
 
-class InvalidCSVError(ValidationFailedError):
-    code = "INVALID_CSV"
-    message = "The CSV file is invalid."
+ValidationError = DomainValidationError
 
 
-class FileValidationError(ValidationFailedError):
-    code = "INVALID_FILE"
-    message = "The uploaded file is invalid."
+class RateLimitError(AppError):
+    status_code = 429
+    code = "RATE_LIMITED"
+
+    def __init__(self, retry_after_seconds: int) -> None:
+        super().__init__(
+            "Too many requests. Please slow down and try again.",
+            details={"retry_after_seconds": retry_after_seconds},
+            headers={"Retry-After": str(retry_after_seconds)},
+        )
+
+
+class ExternalServiceError(AppError):
+    status_code = 502
+    code = "UPSTREAM_ERROR"
+
+    def __init__(self, service: str, message: str = "Upstream service call failed.") -> None:
+        super().__init__(message, details={"service": service})
 
 
 class PaymentVerificationError(AppError):
     status_code = 400
     code = "PAYMENT_VERIFICATION_FAILED"
-    message = "Payment could not be verified."
-
-
-class UnauthorizedError(AppError):
-    status_code = 401
-    code = "UNAUTHORIZED"
-    message = "Authentication is required."
-
-
-class ForbiddenError(AppError):
-    status_code = 403
-    code = "FORBIDDEN"
-    message = "You do not have permission to perform this action."
-
-
-class RateLimitedError(AppError):
-    status_code = 429
-    code = "RATE_LIMITED"
-    message = "Too many requests. Please try again later."
-
-
-class ReceiptGenerationError(AppError):
-    status_code = 500
-    code = "RECEIPT_GENERATION_FAILED"
-    message = "The receipt could not be generated."
-
-
-class ExternalServiceError(AppError):
-    status_code = 502
-    code = "EXTERNAL_SERVICE_ERROR"
-    message = "An external service failed. Please try again later."
-
-
-class ServiceNotConfiguredError(AppError):
-    status_code = 503
-    code = "SERVICE_NOT_CONFIGURED"
-    message = "This feature is not configured yet."

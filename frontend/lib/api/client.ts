@@ -1,6 +1,8 @@
 import type { ApiEnvelope, PageMeta, Paginated } from "@/types/api";
 import { ApiError, ERROR_MESSAGES, errorFromBody, normalizeError } from "./errors";
 
+export { ApiError };
+
 /**
  * Centralised API client (spec §30).
  *

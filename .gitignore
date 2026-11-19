@@ -1,10 +1,12 @@
 # -----------------------------------------------------------------------------
-# Secrets, Keys, and Private Student Records (CRITICAL - NEVER COMMIT)
+# Secrets, Keys, and Local Environment Files (NEVER COMMIT)
 # -----------------------------------------------------------------------------
 .env
 .env.*
-.env.local
+*.env
 !.env.example
+!backend/.env.example
+!frontend/.env.example
 *.csv
 supadetails.txt
 *.pem
@@ -18,6 +20,10 @@ supadetails.txt
 # -----------------------------------------------------------------------------
 .storage/
 */.storage/
+.local_pgdata/
+*/.local_pgdata/
+.db_url
+*/.db_url
 local_storage/
 uploads/
 
@@ -26,6 +32,8 @@ uploads/
 # -----------------------------------------------------------------------------
 .venv/
 */.venv/
+venv/
+*/venv/
 __pycache__/
 */__pycache__/
 *.py[cod]

@@ -1,334 +1,231 @@
 "use client";
 
-import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { importsApi } from "@/lib/api/imports";
-import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { ConfirmDialog } from "@/components/ui/confirm-dialog";
-import { toast } from "sonner";
+import { useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
-  FileSpreadsheet,
   Upload,
+  FileSpreadsheet,
   CheckCircle2,
-  AlertTriangle,
-  ArrowRight,
-  RefreshCw,
-  FileCheck,
+  Download,
+  Loader2,
+  ShieldCheck,
 } from "lucide-react";
-import type { ImportErrorPolicy, ImportJob, ImportPreview } from "@/types/api";
+import { useToast } from "@/components/ui/toast";
+
+interface ImportedStudentSample {
+  student_id: string;
+  name: string;
+  contact_number: string;
+  batch: string;
+  monthly_fee: number;
+  passcode: string;
+}
+
+interface CsvImportResult {
+  id: string;
+  file_name: string;
+  status: string;
+  total_rows: number;
+  inserted_rows: number;
+  updated_rows: number;
+  failed_rows: number;
+  fee_records_upserted: number;
+  error_summary?: {
+    errors?: Array<{ row_number: number; student_id: string; error: string }>;
+    sample_students?: ImportedStudentSample[];
+  };
+}
 
 export default function AdminCsvImportPage() {
+  const [isUploading, setIsUploading] = useState(false);
+  const [result, setResult] = useState<CsvImportResult | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const queryClient = useQueryClient();
-  const [file, setFile] = useState<File | null>(null);
-  const [uploadPercent, setUploadPercent] = useState<number | null>(null);
-  const [preview, setPreview] = useState<ImportPreview | null>(null);
-  const [errorPolicy, setErrorPolicy] = useState<ImportErrorPolicy>("SKIP_ERRORS");
-  const [confirmModalOpen, setConfirmModalOpen] = useState(false);
-  const [completedJob, setCompletedJob] = useState<ImportJob | null>(null);
+  const { toast } = useToast();
 
-  const previewMutation = useMutation({
-    mutationFn: () => {
-      if (!file) throw new Error("No file selected");
-      return importsApi.preview(file, (percent) => setUploadPercent(percent));
-    },
-    onSuccess: (data) => {
-      setPreview(data);
-      toast.success("CSV analysed successfully. Review preview before confirmation.");
-    },
-    onError: (err: unknown) => {
-      toast.error("Failed to parse CSV file. Please verify CSV column headers.");
-    },
-    onSettled: () => setUploadPercent(null),
-  });
+  const handleUpload = async (file: File) => {
+    setIsUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("dry_run", "false");
 
-  const confirmMutation = useMutation({
-    mutationFn: () => {
-      if (!preview) throw new Error("No preview job");
-      return importsApi.confirm(preview.job.id, {
-        error_policy: errorPolicy,
-        create_missing_courses: true,
+      const res = await fetch("/api/backend/v1/imports/csv", {
+        method: "POST",
+        body: formData,
       });
-    },
-    onSuccess: (job) => {
-      setCompletedJob(job);
-      setPreview(null);
-      setFile(null);
-      queryClient.invalidateQueries({ queryKey: ["admin-students"] });
-      toast.success("Migration import executed successfully.");
-    },
-    onError: () => toast.error("Failed to execute CSV import."),
-  });
-
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = e.target.files?.[0];
-    if (selected) {
-      if (!selected.name.endsWith(".csv")) {
-        toast.error("Please select a valid .csv file.");
-        return;
+      const json = await res.json();
+      if (!res.ok || !json.success) {
+        throw new Error(json?.error?.message || "CSV ingestion failed.");
       }
-      setFile(selected);
-      setPreview(null);
-      setCompletedJob(null);
+
+      setResult(json.data);
+      queryClient.invalidateQueries({ queryKey: ["admin"] });
+      toast({
+        type: "success",
+        title: "CSV Ingestion Complete",
+        description: `Upserted ${json.data.total_rows} student records without duplicates.`,
+      });
+    } catch (err) {
+      toast({
+        type: "error",
+        title: "CSV Upload Error",
+        description:
+          err instanceof Error ? err.message : "Could not process CSV file.",
+      });
+    } finally {
+      setIsUploading(false);
     }
   };
 
-  const counts = preview?.job?.summary?.status_counts || {};
+  const handleDownloadSampleCsv = () => {
+    const csvContent = [
+      "Name,Contact Number,Batch,Student ID,Monthly Fee",
+      "AGNIRUDRA BASU,7980353213,ADOAP,RG240017,800",
+      "FARDEEN IQBAL,9163197952,DCAE,RG230031,900",
+      "ABHIGYAN MALLICK,9748488869,PYTHON,BW240038,600",
+    ].join("\n");
+
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "brightway-sample-5col.csv";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight text-slate-900">
-          Legacy Student Data CSV Migration
-        </h1>
-        <p className="text-xs text-slate-500 mt-0.5">
-          Safely preview, validate, and migrate student cohorts from spreadsheet records.
-        </p>
+    <div className="space-y-8">
+      <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-blue-50 text-[#2563EB] px-3 py-0.5 text-xs font-extrabold uppercase">
+            <ShieldCheck className="h-3.5 w-3.5" />
+            Streaming Line-by-Line CSV Parser
+          </span>
+          <h1 className="mt-1.5 font-display text-2xl font-extrabold text-[#1E3A8A]">
+            Student CSV Data Ingestion Engine
+          </h1>
+          <p className="text-xs text-slate-600 mt-1">
+            Accepts standard 5-column CSVs (<code className="font-mono font-bold">Name, Contact Number, Batch, Student ID, Monthly Fee</code>) and Brightway batch sheets. Upserts without duplicating records.
+          </p>
+        </div>
+
+        <button
+          type="button"
+          onClick={handleDownloadSampleCsv}
+          className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 px-4 py-2.5 text-xs font-extrabold text-[#1E3A8A] transition-colors cursor-pointer"
+        >
+          <Download className="h-4 w-4 text-[#F59E0B]" />
+          <span>Download Sample 5-Col CSV</span>
+        </button>
       </div>
 
-      {/* Step 1 & 2: Upload CSV */}
-      {!preview && !completedJob && (
-        <Card className="max-w-2xl">
-          <CardHeader>
-            <CardTitle className="text-base flex items-center gap-2">
-              <FileSpreadsheet className="h-5 w-5 text-blue-600" />
-              Upload Student CSV
-            </CardTitle>
-            <CardDescription className="text-xs leading-relaxed">
-              Required CSV headers: <code className="font-mono bg-slate-100 px-1 py-0.5 rounded">ID No.</code>, <code className="font-mono bg-slate-100 px-1 py-0.5 rounded">Name</code>, <code className="font-mono bg-slate-100 px-1 py-0.5 rounded">Guardian&apos;s Name</code>, <code className="font-mono bg-slate-100 px-1 py-0.5 rounded">Address</code>, <code className="font-mono bg-slate-100 px-1 py-0.5 rounded">Contact No.</code>, <code className="font-mono bg-slate-100 px-1 py-0.5 rounded">Course</code>.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="flex flex-col items-center justify-center border-2 border-dashed border-slate-300 rounded-xl p-8 hover:bg-slate-50/50 transition-colors">
-              <Upload className="h-10 w-10 text-slate-400 mb-2" />
-              <p className="text-xs font-semibold text-slate-700">
-                {file ? file.name : "Choose CSV file from your device"}
+      {/* Upload Dropzone */}
+      <div className="rounded-2xl border-2 border-dashed border-[#2563EB]/40 bg-blue-50/30 p-10 text-center">
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".csv,text/csv"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) handleUpload(f);
+          }}
+          className="hidden"
+        />
+        <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-[#1E3A8A] text-[#FBBF24] shadow-md">
+          <FileSpreadsheet className="h-7 w-7" />
+        </div>
+        <h2 className="mt-4 font-display text-lg font-extrabold text-[#1E3A8A]">
+          Upload Authorized Student CSV File
+        </h2>
+        <p className="mt-1 text-xs text-slate-600 max-w-md mx-auto">
+          Stream-parsed line-by-line in O(1) memory. Existing Student IDs are updated cleanly; new Student IDs are inserted automatically.
+        </p>
+
+        <button
+          type="button"
+          disabled={isUploading}
+          onClick={() => fileInputRef.current?.click()}
+          className="mt-5 inline-flex items-center gap-2 rounded-xl bg-[#2563EB] hover:bg-[#1E3A8A] disabled:opacity-60 text-white px-6 py-3 text-sm font-extrabold shadow-md transition-colors cursor-pointer"
+        >
+          {isUploading ? (
+            <Loader2 className="h-4 w-4 animate-spin text-[#FBBF24]" />
+          ) : (
+            <Upload className="h-4 w-4 text-[#FBBF24]" />
+          )}
+          <span>
+            {isUploading ? "Streaming & Upserting CSV..." : "Select CSV File to Ingest"}
+          </span>
+        </button>
+      </div>
+
+      {/* Ingestion Result Summary */}
+      {result && (
+        <div className="rounded-2xl border border-emerald-200 bg-white p-6 shadow-xs space-y-5">
+          <div className="flex items-center gap-3">
+            <CheckCircle2 className="h-6 w-6 text-emerald-600" />
+            <div>
+              <h3 className="text-base font-extrabold text-slate-900">
+                Completed Ingestion: {result.file_name}
+              </h3>
+              <p className="text-xs text-slate-500">
+                Total Rows: <strong>{result.total_rows}</strong> • Inserted:{" "}
+                <strong>{result.inserted_rows}</strong> • Updated:{" "}
+                <strong>{result.updated_rows}</strong> • Fee Records:{" "}
+                <strong>{result.fee_records_upserted}</strong>
               </p>
-              <p className="text-[11px] text-slate-400 mt-1">UTF-8 encoded comma-separated file</p>
-              <label className="mt-4">
-                <Button variant="outline" size="sm" type="button" className="pointer-events-none">
-                  Browse Files
-                </Button>
-                <input
-                  type="file"
-                  accept=".csv,text/csv"
-                  className="hidden"
-                  onChange={handleFileChange}
-                />
-              </label>
             </div>
+          </div>
 
-            {uploadPercent !== null && (
-              <div className="space-y-1">
-                <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-blue-600 transition-all"
-                    style={{ width: `${uploadPercent}%` }}
-                  />
-                </div>
-                <p className="text-[11px] text-slate-500 text-center">Analysing CSV: {uploadPercent}%</p>
-              </div>
-            )}
-          </CardContent>
-          <CardFooter className="flex justify-end pt-0">
-            <Button
-              variant="primary"
-              disabled={!file}
-              isLoading={previewMutation.isPending}
-              onClick={() => previewMutation.mutate()}
-              className="gap-2"
-            >
-              Preview & Validate Rows
-              <ArrowRight className="h-4 w-4" />
-            </Button>
-          </CardFooter>
-        </Card>
-      )}
-
-      {/* Step 3, 4, 5: Preview Summary & Warnings */}
-      {preview && (
-        <div className="space-y-6">
-          <Card>
-            <CardHeader className="border-b border-slate-100 pb-3">
-              <div className="flex items-center justify-between">
-                <div>
-                  <CardTitle className="text-base">Pre-Import Summary</CardTitle>
-                  <CardDescription className="text-xs">
-                    File: {preview.job.filename} (SHA-256 verified)
-                  </CardDescription>
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="text-xs"
-                  onClick={() => {
-                    setPreview(null);
-                    setFile(null);
-                  }}
-                >
-                  <RefreshCw className="h-3.5 w-3.5 mr-1" />
-                  Upload Different File
-                </Button>
-              </div>
-            </CardHeader>
-            <CardContent className="pt-4">
-              <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-center">
-                <div className="rounded-lg bg-slate-50 p-3 border border-slate-200">
-                  <span className="text-[11px] text-slate-500 font-medium">Total Rows</span>
-                  <p className="text-xl font-bold text-slate-900 mt-1">{preview.job.total_rows}</p>
-                </div>
-                <div className="rounded-lg bg-emerald-50 p-3 border border-emerald-200">
-                  <span className="text-[11px] text-emerald-700 font-medium">Valid</span>
-                  <p className="text-xl font-bold text-emerald-700 mt-1">{counts.VALID ?? 0}</p>
-                </div>
-                <div className="rounded-lg bg-amber-50 p-3 border border-amber-200">
-                  <span className="text-[11px] text-amber-700 font-medium">Warnings</span>
-                  <p className="text-xl font-bold text-amber-700 mt-1">{counts.WARNING ?? 0}</p>
-                </div>
-                <div className="rounded-lg bg-blue-50 p-3 border border-blue-200">
-                  <span className="text-[11px] text-blue-700 font-medium">Already Exists</span>
-                  <p className="text-xl font-bold text-blue-700 mt-1">{counts.EXISTS ?? 0}</p>
-                </div>
-                <div className="rounded-lg bg-rose-50 p-3 border border-rose-200">
-                  <span className="text-[11px] text-rose-700 font-medium">Errors</span>
-                  <p className="text-xl font-bold text-rose-700 mt-1">{counts.ERROR ?? 0}</p>
-                </div>
-              </div>
-
-              {/* Policy selector */}
-              <div className="mt-6 rounded-xl border border-slate-200 p-4 bg-slate-50 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div>
-                  <h4 className="text-xs font-bold text-slate-900">Import Policy</h4>
-                  <p className="text-[11px] text-slate-500 mt-0.5">
-                    How the backend should treat invalid or error rows.
-                  </p>
-                </div>
-                <select
-                  value={errorPolicy}
-                  onChange={(e) => setErrorPolicy(e.target.value as ImportErrorPolicy)}
-                  className="h-9 rounded-lg border border-slate-300 bg-white px-3 text-xs text-slate-700 focus:outline-blue-600"
-                >
-                  <option value="SKIP_ERRORS">SKIP_ERRORS (Import valid, skip problem rows)</option>
-                  <option value="STRICT">STRICT (Rollback if any row contains error)</option>
-                </select>
-              </div>
-            </CardContent>
-            <CardFooter className="flex justify-end pt-2 border-t border-slate-100">
-              <Button
-                variant="primary"
-                onClick={() => setConfirmModalOpen(true)}
-                className="gap-2 text-xs"
-              >
-                Proceed with Confirmation
-                <ArrowRight className="h-4 w-4" />
-              </Button>
-            </CardFooter>
-          </Card>
-
-          {/* Problem rows preview table */}
-          {preview.problem_rows.length > 0 && (
-            <Card className="overflow-hidden">
-              <CardHeader className="pb-3 border-b border-slate-100">
-                <CardTitle className="text-sm flex items-center gap-2 text-amber-800">
-                  <AlertTriangle className="h-4 w-4 text-amber-600" />
-                  Rows Requiring Attention ({preview.problem_rows.length})
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="p-0">
-                <div className="overflow-x-auto max-h-72">
+          {result.error_summary?.sample_students &&
+            result.error_summary.sample_students.length > 0 && (
+              <div>
+                <h4 className="text-xs font-extrabold uppercase tracking-wider text-slate-500 mb-3">
+                  Sample Upserted Student Credentials
+                </h4>
+                <div className="overflow-x-auto rounded-xl border border-slate-200">
                   <table className="w-full text-left text-xs">
-                    <thead className="bg-slate-50 border-b border-slate-200 text-slate-500 uppercase text-[10px] font-semibold">
+                    <thead className="bg-slate-50 text-slate-600 uppercase border-b border-slate-200">
                       <tr>
-                        <th className="py-2.5 px-4">Row #</th>
-                        <th className="py-2.5 px-4">Status</th>
-                        <th className="py-2.5 px-4">Issue Details</th>
+                        <th className="py-2.5 px-4 font-bold">Student ID</th>
+                        <th className="py-2.5 px-4 font-bold">Name</th>
+                        <th className="py-2.5 px-4 font-bold">Batch</th>
+                        <th className="py-2.5 px-4 font-bold">Contact</th>
+                        <th className="py-2.5 px-4 font-bold">Monthly Fee</th>
+                        <th className="py-2.5 px-4 font-bold">Login Passcode</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
-                      {preview.problem_rows.map((row) => (
-                        <tr key={row.id}>
-                          <td className="py-2.5 px-4 font-mono font-semibold text-slate-900">
-                            {row.row_number}
+                      {result.error_summary.sample_students.map((s) => (
+                        <tr key={s.student_id}>
+                          <td className="py-2.5 px-4 font-mono font-bold text-[#1E3A8A]">
+                            {s.student_id}
                           </td>
-                          <td className="py-2.5 px-4">
-                            <Badge
-                              variant={
-                                row.status === "ERROR"
-                                  ? "danger"
-                                  : row.status === "WARNING"
-                                  ? "warning"
-                                  : "default"
-                              }
-                            >
-                              {row.status}
-                            </Badge>
+                          <td className="py-2.5 px-4 font-bold text-slate-900">
+                            {s.name}
                           </td>
-                          <td className="py-2.5 px-4 text-slate-600">
-                            {row.messages?.map((m, i) => (
-                              <p key={i} className="text-[11px]">
-                                {m.message || String(m.code)}
-                              </p>
-                            ))}
+                          <td className="py-2.5 px-4">{s.batch}</td>
+                          <td className="py-2.5 px-4 font-mono">
+                            {s.contact_number}
+                          </td>
+                          <td className="py-2.5 px-4 font-bold">
+                            ₹{s.monthly_fee}
+                          </td>
+                          <td className="py-2.5 px-4 font-mono font-extrabold text-emerald-700">
+                            {s.passcode}
                           </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
-              </CardContent>
-            </Card>
-          )}
+              </div>
+            )}
         </div>
       )}
-
-      {/* Step 7: Completed Report */}
-      {completedJob && (
-        <Card className="border-emerald-200 bg-emerald-50/50 p-6 text-center max-w-xl mx-auto animate-fade-in">
-          <CheckCircle2 className="mx-auto h-12 w-12 text-emerald-600 mb-3" />
-          <h3 className="text-lg font-bold text-slate-900">Import Job Completed</h3>
-          <p className="text-xs text-slate-600 mt-1">
-            Student cohort migrated into Postgres database with duplicate protection.
-          </p>
-          <div className="mt-4 grid grid-cols-2 gap-3 max-w-sm mx-auto text-xs">
-            <div className="bg-white p-3 rounded-lg border border-slate-200 text-left">
-              <span className="text-slate-500">Imported Students:</span>
-              <p className="font-bold text-emerald-600 text-base">
-                {String(completedJob.summary?.imported ?? 0)}
-              </p>
-            </div>
-            <div className="bg-white p-3 rounded-lg border border-slate-200 text-left">
-              <span className="text-slate-500">Skipped (Existing):</span>
-              <p className="font-bold text-slate-700 text-base">
-                {String(completedJob.summary?.skipped_existing ?? 0)}
-              </p>
-            </div>
-          </div>
-          <Button
-            variant="outline"
-            size="sm"
-            className="mt-6"
-            onClick={() => setCompletedJob(null)}
-          >
-            Import Another Batch
-          </Button>
-        </Card>
-      )}
-
-      {/* Confirmation Dialog (spec §36) */}
-      <ConfirmDialog
-        open={confirmModalOpen}
-        onOpenChange={setConfirmModalOpen}
-        title="Execute Database CSV Import"
-        description={`This will write the valid student records into the academy database using policy "${errorPolicy}". Existing student ID numbers will be preserved.`}
-        confirmLabel="Import Now"
-        variant="primary"
-        isLoading={confirmMutation.isPending}
-        onConfirm={async () => {
-          await confirmMutation.mutateAsync();
-          setConfirmModalOpen(false);
-        }}
-      />
     </div>
   );
 }

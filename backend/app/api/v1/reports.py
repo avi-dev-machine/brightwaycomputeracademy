@@ -1,79 +1,55 @@
-from datetime import date, timedelta
 from typing import Any
-from uuid import UUID
 
 from fastapi import APIRouter
-from fastapi.responses import Response
 
-from app.dependencies import AdminUser, ContainerDep, report_service
+from app.core.constants import get_active_month
+from app.dependencies import AdminDep, ContainerDep, report_service
 from app.schemas.common import ApiResponse, ok
-from app.schemas.report import CollectionReport, DashboardStats, OutstandingRow
-from app.utils.dates import local_today
-from app.utils.pagination import PageDep, paged
 
 router = APIRouter()
 
-_CSV: dict[int | str, dict[str, Any]] = {200: {"content": {"text/csv": {}}}}
 
-
-def _csv(data: bytes, filename: str) -> Response:
-    return Response(
-        content=data,
-        media_type="text/csv; charset=utf-8",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Cache-Control": "private, no-store",
-        },
+@router.get("/dashboard", response_model=ApiResponse[dict[str, Any]])
+def dashboard(
+    _user: AdminDep,
+    container: ContainerDep,
+    month_year: str | None = None,
+    month: str | None = None,
+    batch: str | None = None,
+    course: str | None = None,
+) -> ApiResponse[dict[str, Any]]:
+    resolved_month = get_active_month(month or month_year)
+    return ok(
+        report_service(container).dashboard(
+            month_year=resolved_month,
+            batch=course or batch,
+        )
     )
 
 
-def _range(
-    container: ContainerDep, date_from: date | None, date_to: date | None
-) -> tuple[date, date]:
-    end = date_to or local_today(container.settings.timezone)
-    return date_from or end.replace(day=1), end
-
-
-@router.get("/dashboard", response_model=ApiResponse[DashboardStats])
-def dashboard(user: AdminUser, container: ContainerDep) -> ApiResponse[DashboardStats]:
-    return ok(report_service(container).dashboard())
-
-
-@router.get("/fees/collections", response_model=ApiResponse[CollectionReport])
-def fee_collections(
-    user: AdminUser,
+@router.get("/fee-ledger", response_model=ApiResponse[dict[str, Any]])
+def fee_ledger_matrix(
+    _user: AdminDep,
     container: ContainerDep,
-    date_from: date | None = None,
-    date_to: date | None = None,
-) -> ApiResponse[CollectionReport]:
-    start, end = _range(container, date_from, date_to)
-    return ok(report_service(container).collections(start, end))
-
-
-@router.get("/fees/outstanding", response_model=ApiResponse[list[OutstandingRow]])
-def outstanding_fees(
-    user: AdminUser, container: ContainerDep, params: PageDep, course_id: UUID | None = None
-) -> ApiResponse[list[OutstandingRow]]:
-    return paged(report_service(container).outstanding(course_id=course_id, params=params))
-
-
-@router.get("/exports/students.csv", response_class=Response, responses=_CSV)
-def export_students(user: AdminUser, container: ContainerDep) -> Response:
-    return _csv(report_service(container).export_students(), "students.csv")
-
-
-@router.get("/exports/fees.csv", response_class=Response, responses=_CSV)
-def export_fees(user: AdminUser, container: ContainerDep) -> Response:
-    return _csv(report_service(container).export_fees(), "fees.csv")
-
-
-@router.get("/exports/payments.csv", response_class=Response, responses=_CSV)
-def export_payments(
-    user: AdminUser,
-    container: ContainerDep,
-    date_from: date | None = None,
-    date_to: date | None = None,
-) -> Response:
-    end = date_to or local_today(container.settings.timezone)
-    start = date_from or end - timedelta(days=30)
-    return _csv(report_service(container).export_payments(start, end), "payments.csv")
+    year: int = 2027,
+    active_month: str | None = None,
+    month: str | None = None,
+    batch: str | None = None,
+    course: str | None = None,
+    search: str | None = None,
+    status_filter: str | None = None,
+    page: int = 1,
+    page_size: int = 100,
+) -> ApiResponse[dict[str, Any]]:
+    resolved_month = get_active_month(month or active_month)
+    return ok(
+        report_service(container).fee_ledger_matrix(
+            year=year,
+            active_month=resolved_month,
+            batch=course or batch,
+            search=search,
+            status_filter=status_filter,
+            page=page,
+            page_size=page_size,
+        )
+    )

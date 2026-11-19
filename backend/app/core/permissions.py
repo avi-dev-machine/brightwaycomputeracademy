@@ -1,62 +1,54 @@
-"""The authenticated user and resource-level access checks (role + ownership)."""
+"""Role-based access control (RBAC) dependencies and ownership guards."""
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from typing import Annotated
 from uuid import UUID
 
+from fastapi import Depends
+
 from app.core.constants import Role
-from app.db.client import DbConnection
-from app.exceptions import ForbiddenError
-from app.repositories.batch_repository import BatchRepository
+from app.core.errors import AuthorizationError
+from app.core.security import AuthenticatedUser, CurrentUser
 
 
-@dataclass(frozen=True)
-class CurrentUser:
-    user_id: UUID
-    role: Role
-    email: str | None = None
-    student_id: UUID | None = None
-    teacher_id: UUID | None = None
+def require_roles(*allowed: Role) -> Callable[[CurrentUser], CurrentUser]:
+    allowed_set = set(allowed)
+    if Role.ADMIN in allowed_set or Role.SUPER_ADMIN in allowed_set:
+        allowed_set.add(Role.ADMIN)
+        allowed_set.add(Role.SUPER_ADMIN)
 
-    @property
-    def is_admin(self) -> bool:
-        return self.role == Role.ADMIN
+    def _check(user: AuthenticatedUser) -> CurrentUser:
+        if user.role not in allowed_set:
+            raise AuthorizationError(
+                f"Role {user.role.value} cannot access this resource.",
+                details={"required_roles": sorted(r.value for r in allowed_set)},
+            )
+        return user
 
-    @property
-    def is_teacher(self) -> bool:
-        return self.role == Role.TEACHER
-
-    @property
-    def is_student(self) -> bool:
-        return self.role == Role.STUDENT
+    return _check
 
 
-def require_role(user: CurrentUser, *roles: Role) -> None:
-    if user.role not in roles:
-        raise ForbiddenError()
+AdminUser = Annotated[CurrentUser, Depends(require_roles(Role.SUPER_ADMIN, Role.ADMIN))]
+StaffUser = Annotated[CurrentUser, Depends(require_roles(Role.SUPER_ADMIN, Role.ADMIN))]
+StudentUser = Annotated[CurrentUser, Depends(require_roles(Role.STUDENT))]
 
 
-def ensure_student_access(conn: DbConnection, user: CurrentUser, student_id: UUID) -> None:
-    """Admins see everyone, students only themselves, teachers only students in their batches."""
+def assert_student_self_or_staff(
+    user: CurrentUser,
+    *,
+    student_uuid: UUID | None = None,
+    student_id_code: str | None = None,
+) -> None:
+    """Allow SUPER_ADMIN/ADMIN unconditionally; allow STUDENT only on their own record."""
     if user.is_admin:
         return
-    if user.is_student and user.student_id == student_id:
-        return
-    if (
-        user.is_teacher
-        and user.teacher_id is not None
-        and BatchRepository(conn).teacher_has_student(user.teacher_id, student_id)
-    ):
-        return
-    raise ForbiddenError("You do not have access to this student.")
-
-
-def ensure_batch_access(conn: DbConnection, user: CurrentUser, batch_id: UUID) -> None:
-    if user.is_admin:
-        return
-    if (
-        user.is_teacher
-        and user.teacher_id is not None
-        and BatchRepository(conn).is_teacher_of_batch(user.teacher_id, batch_id)
-    ):
-        return
-    raise ForbiddenError("You do not have access to this batch.")
+    if user.role == Role.STUDENT:
+        if student_uuid is not None and user.id == student_uuid:
+            return
+        if (
+            student_id_code is not None
+            and user.student_id
+            and user.student_id.upper() == student_id_code.strip().upper()
+        ):
+            return
+    raise AuthorizationError("Students may only access their own record.")

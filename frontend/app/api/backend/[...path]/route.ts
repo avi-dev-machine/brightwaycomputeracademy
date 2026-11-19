@@ -1,7 +1,8 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { getValidAccessToken } from "@/lib/auth/server-session";
+import { getBackendBaseUrl } from "@/lib/api/backend-url";
 
-const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:8000";
+const API_BASE_URL = getBackendBaseUrl();
 
 const SAFE_SEGMENT_RE = /^[a-zA-Z0-9_.-]+$/;
 const SAFE_IDEMPOTENCY_RE = /^[a-zA-Z0-9_.:-]{1,128}$/;
@@ -25,7 +26,8 @@ async function proxyRequest(request: NextRequest, { params }: { params: Promise<
     }
   }
 
-  const backendPath = path.join("/");
+  const normalizedSegments = path[0] === "v1" ? path.slice(1) : path;
+  const backendPath = normalizedSegments.join("/");
   const search = request.nextUrl.search;
   const targetUrl = `${API_BASE_URL}/api/v1/${backendPath}${search}`;
 

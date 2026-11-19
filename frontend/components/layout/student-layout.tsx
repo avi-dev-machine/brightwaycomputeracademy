@@ -2,129 +2,145 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import type { ReactNode } from "react";
-import { useAuth } from "@/providers/auth-provider";
+import { useState, type ReactNode } from "react";
 import {
+  GraduationCap,
   LayoutDashboard,
   CreditCard,
-  Receipt,
-  CalendarCheck,
-  User,
-  Bell,
+  IdCard,
   LogOut,
+  Menu,
+  X,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { useAuth } from "@/providers/auth-provider";
 
-const studentNav = [
-  { href: "/student", label: "Overview", icon: LayoutDashboard, exact: true },
-  { href: "/student/fees", label: "Fees & dues", icon: CreditCard },
-  { href: "/student/receipts", label: "Receipts", icon: Receipt },
-  { href: "/student/attendance", label: "Attendance", icon: CalendarCheck },
-  { href: "/student/profile", label: "Academic record", icon: User },
+const navItems = [
+  { href: "/student", label: "Dashboard & ID Card", icon: LayoutDashboard },
+  { href: "/student/fees", label: "Fee Payment Portal", icon: CreditCard },
+  { href: "/student/profile", label: "Photo & Digital ID", icon: IdCard },
 ];
 
 export function StudentLayout({ children }: { children: ReactNode }) {
   const pathname = usePathname();
-  const { logout } = useAuth();
-
-  const isActive = (href: string, exact?: boolean) => {
-    if (!pathname) return false;
-    if (exact) return pathname === href;
-    return pathname === href || pathname.startsWith(`${href}/`);
-  };
+  const { user, logout } = useAuth();
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   return (
-    <div className="flex min-h-screen flex-col bg-white pb-16 md:pb-0">
-      {/* Top Header */}
-      <header className="sticky top-0 z-30 border-b border-rule bg-white">
-        <div className="mx-auto flex h-14 max-w-5xl items-center justify-between px-4 sm:px-6">
-          <Link href="/student" className="flex items-baseline gap-2">
-            <span className="display text-xl leading-none text-ink">Brightway</span>
-            <span className="text-[11px] font-medium text-slate-400">Student</span>
-          </Link>
+    <div className="min-h-screen flex flex-col bg-slate-50">
+      {/* Top Navbar in Brightway Deep Trust Blue (#1E3A8A) */}
+      <header className="sticky top-0 z-30 border-b border-blue-950/20 bg-[#1E3A8A] text-white shadow-md">
+        <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-4 sm:px-6 lg:px-8">
+          <div className="flex items-center gap-6">
+            <Link href="/student" className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-white/10 text-[#FBBF24] ring-1 ring-[#FBBF24]/40">
+                <GraduationCap className="h-5 w-5" />
+              </div>
+              <div className="flex flex-col">
+                <span className="font-display text-base font-extrabold tracking-tight text-white leading-none">
+                  BRIGHTWAY
+                </span>
+                <span className="text-[10px] font-bold uppercase tracking-widest text-[#FBBF24] mt-0.5">
+                  Student Portal
+                </span>
+              </div>
+            </Link>
 
-          {/* Desktop Nav */}
-          <nav aria-label="Student portal" className="hidden md:flex items-center gap-1">
-            {studentNav.map((item) => {
-              const active = isActive(item.href, item.exact);
+            <nav className="hidden md:flex items-center gap-1.5">
+              {navItems.map((item) => {
+                const isActive =
+                  item.href === "/student"
+                    ? pathname === "/student"
+                    : pathname.startsWith(item.href);
+                const Icon = item.icon;
+                return (
+                  <Link
+                    key={item.href}
+                    href={item.href}
+                    className={`flex items-center gap-2 rounded-xl px-3.5 py-2 text-xs font-bold transition-all ${
+                      isActive
+                        ? "bg-[#F59E0B] text-slate-950 shadow-xs"
+                        : "text-blue-100 hover:bg-white/10 hover:text-white"
+                    }`}
+                  >
+                    <Icon className="h-4 w-4" />
+                    <span>{item.label}</span>
+                  </Link>
+                );
+              })}
+            </nav>
+          </div>
+
+          <div className="hidden md:flex items-center gap-4">
+            <div className="text-right">
+              <p className="text-xs font-extrabold text-white">
+                {user?.display_name || "Student"}
+              </p>
+              <p className="text-[11px] font-mono text-[#FBBF24]">
+                {user?.student_code || "STUDENT"}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={logout}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-white/10 hover:bg-red-500/90 px-3.5 py-2 text-xs font-bold text-white transition-colors cursor-pointer"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              <span>Sign Out</span>
+            </button>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+            className="md:hidden rounded-lg p-2 text-blue-100 hover:bg-white/10"
+            aria-label="Open menu"
+          >
+            {mobileMenuOpen ? <X className="h-6 w-6" /> : <Menu className="h-6 w-6" />}
+          </button>
+        </div>
+
+        {mobileMenuOpen && (
+          <div className="md:hidden border-t border-white/10 bg-[#1E3A8A] px-4 py-3 space-y-1.5">
+            {navItems.map((item) => {
               const Icon = item.icon;
               return (
                 <Link
                   key={item.href}
                   href={item.href}
-                  aria-current={active ? "page" : undefined}
-                  className={cn(
-                    "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
-                    active
-                      ? "bg-slate-100 text-ink"
-                      : "text-slate-500 hover:text-ink hover:bg-slate-50",
-                  )}
+                  onClick={() => setMobileMenuOpen(false)}
+                  className="flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-bold text-white hover:bg-white/10"
                 >
-                  <Icon
-                    strokeWidth={1.75}
-                    className={cn(
-                      "h-3.5 w-3.5",
-                      active ? "text-blue-700" : "text-slate-400",
-                    )}
-                  />
-                  {item.label}
+                  <Icon className="h-4 w-4 text-[#FBBF24]" />
+                  <span>{item.label}</span>
                 </Link>
               );
             })}
-          </nav>
-
-          {/* User actions */}
-          <div className="flex items-center gap-1.5">
-            <Link
-              href="/student/notifications"
-              aria-label="Notifications"
-              className="flex h-8 w-8 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-ink transition-colors"
-            >
-              <Bell className="h-4 w-4" strokeWidth={1.75} />
-            </Link>
-
             <button
-              onClick={() => logout()}
-              aria-label="Sign out"
-              title="Sign out"
-              className="hidden sm:inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs text-slate-500 hover:bg-slate-100 hover:text-ink transition-colors cursor-pointer"
+              type="button"
+              onClick={logout}
+              className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-bold text-red-300 hover:bg-white/10"
             >
-              <LogOut className="h-3.5 w-3.5" strokeWidth={1.75} />
-              <span>Sign out</span>
+              <LogOut className="h-4 w-4" />
+              <span>Sign Out</span>
             </button>
           </div>
-        </div>
+        )}
       </header>
 
-      {/* Main Page Content */}
-      <main className="mx-auto w-full max-w-5xl flex-1 px-4 py-8 sm:px-6">
+      <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-8 sm:px-6 lg:px-8">
         {children}
       </main>
 
-      {/* Mobile Bottom Navigation */}
-      <nav
-        aria-label="Mobile navigation"
-        className="fixed bottom-0 left-0 right-0 z-40 flex h-14 items-center justify-around border-t border-rule bg-white md:hidden"
-      >
-        {studentNav.map((item) => {
-          const active = isActive(item.href, item.exact);
-          const Icon = item.icon;
-          return (
-            <Link
-              key={item.href}
-              href={item.href}
-              aria-current={active ? "page" : undefined}
-              className={cn(
-                "flex flex-col items-center justify-center py-1 transition-colors",
-                active ? "text-blue-700 font-medium" : "text-slate-500 hover:text-ink",
-              )}
-            >
-              <Icon strokeWidth={1.75} className="h-4 w-4" />
-              <span className="text-[10px] mt-1">{item.label}</span>
-            </Link>
-          );
-        })}
-      </nav>
+      <footer className="border-t border-slate-200 bg-white py-5">
+        <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
+          <span>
+            &copy; 2027 BRIGHTWAY COMPUTER EDUCATION — Affiliated to RGYCSM (rgycsm.org)
+          </span>
+          <span className="font-semibold text-[#1E3A8A]">
+            Secured by Razorpay &amp; 256-Bit Verification
+          </span>
+        </div>
+      </footer>
     </div>
   );
 }

@@ -1,8 +1,9 @@
 import { NextResponse } from "next/server";
 import { setAuthCookies } from "@/lib/auth/server-session";
+import { getBackendBaseUrl } from "@/lib/api/backend-url";
 import type { LoginRequest, MeOut, TokenOut } from "@/types/api";
 
-const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:8000";
+const API_BASE_URL = getBackendBaseUrl();
 
 export async function POST(request: Request) {
   try {

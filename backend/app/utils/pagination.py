@@ -5,6 +5,7 @@ from math import ceil
 from typing import Annotated, Generic, TypeVar
 
 from fastapi import Depends, Query
+from pydantic import BaseModel
 
 from app.core.constants import MAX_PAGE_SIZE
 from app.schemas.common import ApiResponse, PageMeta
@@ -26,19 +27,21 @@ class PageParams:
         return self.page_size
 
 
-@dataclass
-class Page(Generic[T]):
+class Page(BaseModel, Generic[T]):
     items: list[T]
-    total: int
-    params: PageParams
+    meta: PageMeta
 
-    def meta(self) -> PageMeta:
-        pages = ceil(self.total / self.params.page_size) if self.total else 0
-        return PageMeta(
-            page=self.params.page,
-            page_size=self.params.page_size,
-            total=self.total,
-            total_pages=pages,
+    @classmethod
+    def of(cls, items: list[T], total: int, params: PageParams) -> "Page[T]":
+        pages = ceil(total / params.page_size) if total else 1
+        return cls(
+            items=items,
+            meta=PageMeta(
+                page=params.page,
+                page_size=params.page_size,
+                total=total,
+                total_pages=pages,
+            ),
         )
 
 
@@ -53,4 +56,4 @@ PageDep = Annotated[PageParams, Depends(page_params)]
 
 
 def paged(page: Page[T]) -> ApiResponse[list[T]]:
-    return ApiResponse[list[T]](data=page.items, meta=page.meta())
+    return ApiResponse[list[T]](data=page.items, meta=page.meta)

@@ -1,169 +1,204 @@
-from typing import Annotated
-from uuid import UUID
+from typing import Any
 
-from fastapi import APIRouter, File, Query, UploadFile, status
-from fastapi.responses import Response
+from fastapi import APIRouter, File, Response, UploadFile, status
+from pydantic import BaseModel, Field
 
+from app.core.constants import get_active_month
 from app.dependencies import (
-    AdminUser,
+    AdminDep,
     ContainerDep,
     CurrentUserDep,
-    StaffUser,
-    notification_service,
+    id_card_service,
     student_service,
 )
-from app.models.student import Student, StudentMonthlyFee, StudentStatus
 from app.schemas.common import ApiResponse, ok
-from app.schemas.student import (
-    BroadcastDueNoticeRequest,
-    BroadcastDueNoticeResult,
-    DueFeeNoticeResult,
-    StudentCreate,
-    StudentPhotoResult,
-    StudentUpdate,
-)
-from app.utils.file_validation import read_upload_limited
-from app.utils.pagination import PageDep, paged
+from app.utils.pagination import Page, PageDep
 
 router = APIRouter()
 
 
-@router.get("", response_model=ApiResponse[list[Student]])
+class StudentWritePayload(BaseModel):
+    student_id: str | None = Field(default=None, max_length=64)
+    enrollment_number: str | None = Field(default=None, max_length=64)
+    name: str | None = Field(default=None, max_length=200)
+    full_name: str | None = Field(default=None, max_length=200)
+    password: str | None = Field(default=None, max_length=128)
+    contact_number: str | None = Field(default=None, max_length=32)
+    phone: str | None = Field(default=None, max_length=32)
+    course: str | None = Field(default=None, max_length=120)
+    batch: str | None = Field(default=None, max_length=120)
+    monthly_fee: float | None = Field(default=None, ge=0)
+    fee_status: str | None = Field(default=None, max_length=32)
+    month: str | None = Field(default=None, max_length=32)
+
+
+@router.get("", response_model=ApiResponse[Page[dict[str, Any]]])
 def list_students(
-    user: StaffUser,
+    page: PageDep,
+    _user: AdminDep,
     container: ContainerDep,
-    params: PageDep,
-    q: Annotated[
-        str | None, Query(max_length=100, description="Name, ID No., contact or guardian")
-    ] = None,
-    course_id: UUID | None = None,
-    batch_id: UUID | None = None,
-    status: StudentStatus | None = None,
-    program: str | None = None,
-    has_id: bool | None = None,
+    search: str | None = None,
+    batch: str | None = None,
+    course: str | None = None,
     fee_status: str | None = None,
-) -> ApiResponse[list[Student]]:
-    return paged(
-        student_service(container).search(
-            user,
-            q=q,
-            course_id=course_id,
-            batch_id=batch_id,
-            status=status,
-            program=program,
-            has_id=has_id,
-            fee_status=fee_status,
-            params=params,
-        )
-    )
-
-
-@router.post("", response_model=ApiResponse[Student], status_code=status.HTTP_201_CREATED)
-def create_student(
-    payload: StudentCreate, user: AdminUser, container: ContainerDep
-) -> ApiResponse[Student]:
-    return ok(student_service(container).create(user, payload))
-
-
-@router.get("/me", response_model=ApiResponse[Student])
-def get_my_record(user: CurrentUserDep, container: ContainerDep) -> ApiResponse[Student]:
-    return ok(student_service(container).get_own(user))
-
-
-@router.post("/notify-all-unpaid", response_model=ApiResponse[BroadcastDueNoticeResult])
-def notify_all_unpaid_students(
-    user: AdminUser,
-    container: ContainerDep,
-    payload: BroadcastDueNoticeRequest | None = None,
-) -> ApiResponse[BroadcastDueNoticeResult]:
-    p = payload or BroadcastDueNoticeRequest()
+    id_status: str | None = None,
+    month_year: str | None = None,
+    month: str | None = None,
+) -> ApiResponse[Page[dict[str, Any]]]:
+    resolved_month = get_active_month(month or month_year)
     return ok(
-        student_service(container).notify_all_unpaid(
-            user,
-            notification_service(container),
-            program=p.program,
-            course_id=p.course_id,
-            custom_note=p.custom_note,
+        student_service(container).list(
+            page,
+            search=search,
+            batch=batch,
+            course=course,
+            fee_status=fee_status,
+            id_status=id_status,
+            month_year=resolved_month,
         )
     )
 
 
-@router.get("/{student_id}", response_model=ApiResponse[Student])
+@router.post(
+    "", response_model=ApiResponse[dict[str, Any]], status_code=status.HTTP_201_CREATED
+)
+def create_student(
+    payload: StudentWritePayload, _user: AdminDep, container: ContainerDep
+) -> ApiResponse[dict[str, Any]]:
+    return ok(student_service(container).create(payload.model_dump(exclude_none=True)))
+
+
+@router.get("/me", response_model=ApiResponse[dict[str, Any]])
+def get_my_student_profile(
+    user: CurrentUserDep, container: ContainerDep
+) -> ApiResponse[dict[str, Any]]:
+    return ok(student_service(container).get_me(user))
+
+
+@router.post("/me/photo", response_model=ApiResponse[dict[str, Any]])
+@router.put("/me/photo", response_model=ApiResponse[dict[str, Any]])
+async def upload_my_photo(
+    user: CurrentUserDep,
+    container: ContainerDep,
+    file: UploadFile = File(...),
+) -> ApiResponse[dict[str, Any]]:
+    data = await file.read()
+    target_id = user.student_id or str(user.id)
+    return ok(
+        student_service(container).upload_photo(
+            user,
+            target_id,
+            filename=file.filename or "photo.jpg",
+            content_type=file.content_type,
+            data=data,
+        )
+    )
+
+
+@router.get("/me/id-card.pdf")
+def download_my_id_card_pdf(
+    user: CurrentUserDep, container: ContainerDep
+) -> Response:
+    target_id = user.student_id or str(user.id)
+    pdf_bytes, filename = id_card_service(container).render_pdf(user, target_id)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/me/id-card.png")
+def download_my_id_card_png(
+    user: CurrentUserDep, container: ContainerDep
+) -> Response:
+    target_id = user.student_id or str(user.id)
+    png_bytes, filename = id_card_service(container).render_png(user, target_id)
+    return Response(
+        content=png_bytes,
+        media_type="image/png",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{student_id}", response_model=ApiResponse[dict[str, Any]])
 def get_student(
-    student_id: UUID, user: CurrentUserDep, container: ContainerDep
-) -> ApiResponse[Student]:
+    student_id: str, user: CurrentUserDep, container: ContainerDep
+) -> ApiResponse[dict[str, Any]]:
     return ok(student_service(container).get(user, student_id))
 
 
-@router.get("/{student_id}/monthly-fees", response_model=ApiResponse[list[StudentMonthlyFee]])
-def get_student_monthly_fees(
-    student_id: UUID, user: CurrentUserDep, container: ContainerDep
-) -> ApiResponse[list[StudentMonthlyFee]]:
-    return ok(student_service(container).get_monthly_fees(user, student_id))
-
-
-@router.post("/{student_id}/notify-due-fee", response_model=ApiResponse[DueFeeNoticeResult])
-def notify_student_due_fee(
-    student_id: UUID,
-    user: AdminUser,
+@router.put("/{student_id}", response_model=ApiResponse[dict[str, Any]])
+@router.patch("/{student_id}", response_model=ApiResponse[dict[str, Any]])
+def update_student(
+    student_id: str,
+    payload: StudentWritePayload,
+    _user: AdminDep,
     container: ContainerDep,
-    custom_note: str | None = None,
-) -> ApiResponse[DueFeeNoticeResult]:
+) -> ApiResponse[dict[str, Any]]:
     return ok(
-        student_service(container).notify_due_fee(
-            user,
-            student_id,
-            notification_service(container),
-            custom_note=custom_note,
+        student_service(container).update(
+            student_id, payload.model_dump(exclude_unset=True)
         )
     )
 
 
-@router.patch("/{student_id}", response_model=ApiResponse[Student])
-def update_student(
-    student_id: UUID, payload: StudentUpdate, user: AdminUser, container: ContainerDep
-) -> ApiResponse[Student]:
-    return ok(student_service(container).update(user, student_id, payload))
+@router.delete("/{student_id}", response_model=ApiResponse[dict[str, Any]])
+def delete_student(
+    student_id: str, _user: AdminDep, container: ContainerDep
+) -> ApiResponse[dict[str, Any]]:
+    return ok(student_service(container).delete(student_id))
 
 
-@router.post("/{student_id}/deactivate", response_model=ApiResponse[Student])
-def deactivate_student(
-    student_id: UUID, user: AdminUser, container: ContainerDep
-) -> ApiResponse[Student]:
-    """Students are never hard-deleted; payments and receipts stay intact."""
-    return ok(student_service(container).set_status(user, student_id, StudentStatus.INACTIVE))
-
-
-@router.post("/{student_id}/activate", response_model=ApiResponse[Student])
-def activate_student(
-    student_id: UUID, user: AdminUser, container: ContainerDep
-) -> ApiResponse[Student]:
-    return ok(student_service(container).set_status(user, student_id, StudentStatus.ACTIVE))
-
-
-@router.put("/{student_id}/photo", response_model=ApiResponse[StudentPhotoResult])
-def upload_photo(
-    student_id: UUID,
-    user: AdminUser,
+@router.put("/{student_id}/photo", response_model=ApiResponse[dict[str, Any]])
+@router.post("/{student_id}/photo", response_model=ApiResponse[dict[str, Any]])
+async def upload_student_photo(
+    student_id: str,
+    user: CurrentUserDep,
     container: ContainerDep,
-    photo: Annotated[UploadFile, File(description="JPEG, PNG or WebP, max 5 MB")],
-) -> ApiResponse[StudentPhotoResult]:
-    """Validate and store the photo, then regenerate the student's ID card."""
-    data = read_upload_limited(photo.file, container.settings.max_photo_bytes)
+    file: UploadFile = File(...),
+) -> ApiResponse[dict[str, Any]]:
+    data = await file.read()
     return ok(
         student_service(container).upload_photo(
-            user, student_id, data=data, filename=photo.filename, content_type=photo.content_type
+            user,
+            student_id,
+            filename=file.filename or "photo.jpg",
+            content_type=file.content_type,
+            data=data,
         )
     )
 
 
-@router.get(
-    "/{student_id}/photo",
-    response_class=Response,
-    responses={200: {"content": {"image/jpeg": {}}}},
-)
-def get_photo(student_id: UUID, user: CurrentUserDep, container: ContainerDep) -> Response:
-    data = student_service(container).get_photo(user, student_id)
+@router.get("/{student_id}/photo")
+def get_student_photo(student_id: str, container: ContainerDep) -> Response:
+    raw_bytes, media_type = student_service(container).get_photo_bytes(student_id)
     return Response(
-        content=data, media_type="image/jpeg", headers={"Cache-Control": "private, no-store"}
+        content=raw_bytes,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=60"},
+    )
+
+
+@router.get("/{student_id}/id-card.pdf")
+def download_student_id_card_pdf(
+    student_id: str, user: CurrentUserDep, container: ContainerDep
+) -> Response:
+    pdf_bytes, filename = id_card_service(container).render_pdf(user, student_id)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{student_id}/id-card.png")
+def download_student_id_card_png(
+    student_id: str, user: CurrentUserDep, container: ContainerDep
+) -> Response:
+    png_bytes, filename = id_card_service(container).render_png(user, student_id)
+    return Response(
+        content=png_bytes,
+        media_type="image/png",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )

@@ -1,142 +1,176 @@
 "use client";
 
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { coursesApi } from "@/lib/api/courses";
-import { PublicHeader } from "@/components/layout/public-header";
-import { PublicFooter } from "@/components/layout/public-footer";
-import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Badge } from "@/components/ui/badge";
-import { Skeleton } from "@/components/ui/skeleton";
-import { EmptyState } from "@/components/ui/empty-state";
-import { formatCurrency } from "@/lib/utils";
 import Link from "next/link";
-import { BookOpen, Clock, Search, ArrowRight } from "lucide-react";
+import {
+  Award,
+  BookOpen,
+  CheckCircle2,
+  Clock,
+  ExternalLink,
+  Search,
+  ArrowRight,
+  MapPin,
+} from "lucide-react";
+import {
+  PublicHeader,
+  GOOGLE_MAPS_URL,
+  RGYCSM_COURSES_URL,
+} from "@/components/layout/public-header";
+import { PublicFooter } from "@/components/layout/public-footer";
+import { rgycsmCourses } from "../page";
 
 export default function CoursesPage() {
   const [searchTerm, setSearchTerm] = useState("");
 
-  const { data, isLoading, error } = useQuery({
-    queryKey: ["public-courses", searchTerm],
-    queryFn: () => coursesApi.list({ active: true, q: searchTerm || undefined }),
+  const filtered = rgycsmCourses.filter((c) => {
+    const q = searchTerm.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      c.code.toLowerCase().includes(q) ||
+      c.title.toLowerCase().includes(q) ||
+      c.description.toLowerCase().includes(q) ||
+      c.highlights.some((h) => h.toLowerCase().includes(q))
+    );
   });
 
-  const courses = data?.items || [];
-
   return (
-    <div className="flex min-h-screen flex-col bg-slate-50">
+    <div className="flex min-h-screen flex-col bg-slate-50 text-slate-900">
       <PublicHeader />
 
-      <main className="flex-1 py-12">
-        <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
-          <div className="text-center max-w-2xl mx-auto mb-10">
-            <h1 className="text-3xl font-extrabold tracking-tight text-slate-900 sm:text-4xl">
-              Academic Courses & Programs
-            </h1>
-            <p className="mt-3 text-sm text-slate-600">
-              Practical, certification-oriented computer programs designed for beginners and advancing professionals.
-            </p>
+      <main className="flex-1">
+        {/* Page Hero */}
+        <section className="bg-gradient-to-r from-[#0F172A] via-[#1E3A8A] to-[#2563EB] text-white py-14">
+          <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6">
+              <div className="space-y-3 max-w-3xl">
+                <div className="inline-flex items-center gap-2 rounded-full bg-[#F59E0B] text-slate-950 px-3.5 py-1 text-xs font-extrabold uppercase">
+                  <Award className="h-3.5 w-3.5" />
+                  <span>Affiliated with RGYCSM (rgycsm.org/courses)</span>
+                </div>
+                <h1 className="font-display text-3xl sm:text-4xl font-black">
+                  BRIGHTWAY COMPUTER EDUCATION — Course Directory
+                </h1>
+                <p className="text-sm text-blue-100 leading-relaxed">
+                  Explore our RGYCSM-affiliated Advance Diplomas, Accounting &amp; Desktop Publishing programs, Certificate courses, and Class IV–XII Computer Science coaching.
+                </p>
+              </div>
 
-            {/* Search input */}
-            <div className="mt-6 relative max-w-md mx-auto">
-              <Input
-                type="text"
-                placeholder="Search by course name or code..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                className="pl-9 bg-white"
-              />
-              <Search className="absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
+              <div className="flex flex-wrap items-center gap-3">
+                <a
+                  href={RGYCSM_COURSES_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-2 rounded-xl bg-[#F59E0B] hover:bg-[#FBBF24] text-slate-950 font-extrabold px-5 py-3 text-xs shadow-lg transition-colors"
+                >
+                  <BookOpen className="h-4 w-4" />
+                  <span>Official RGYCSM Course Catalog</span>
+                  <ExternalLink className="h-3.5 w-3.5" />
+                </a>
+                <a
+                  href={GOOGLE_MAPS_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-2 rounded-xl bg-white/10 hover:bg-white/20 border border-white/20 text-white font-bold px-4 py-3 text-xs transition-colors"
+                >
+                  <MapPin className="h-4 w-4 text-[#FBBF24]" />
+                  <span>Campus Location</span>
+                </a>
+              </div>
             </div>
           </div>
+        </section>
 
-          {/* Loading state */}
-          {isLoading && (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-              {[1, 2, 3, 4, 5, 6].map((i) => (
-                <Card key={i} className="h-48 p-6 space-y-4">
-                  <Skeleton className="h-6 w-3/4" />
-                  <Skeleton className="h-4 w-1/2" />
-                  <Skeleton className="h-16 w-full" />
-                </Card>
-              ))}
+        <section className="py-12">
+          <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 space-y-8">
+            {/* Search Filter */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs">
+              <div className="relative flex-1 max-w-md">
+                <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+                <input
+                  type="text"
+                  placeholder="Search ADOAP, DCAE, DDTP, Tally, Photoshop, Python..."
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  className="w-full rounded-xl border border-slate-300 pl-10 pr-4 py-2.5 text-xs font-medium focus:border-[#2563EB] focus:outline-hidden"
+                />
+              </div>
+              <div className="text-xs text-slate-600 font-medium">
+                Showing <strong>{filtered.length}</strong> RGYCSM &amp; Academic Programs
+              </div>
             </div>
-          )}
 
-          {/* Error state */}
-          {error && (
-            <div className="rounded-xl border border-rose-200 bg-rose-50 p-6 text-center text-xs text-rose-700">
-              Unable to load course catalog at this time. Please try refreshing.
-            </div>
-          )}
-
-          {/* Empty state */}
-          {!isLoading && !error && courses.length === 0 && (
-            <EmptyState
-              icon={<BookOpen className="h-8 w-8" />}
-              title="No courses found"
-              description={
-                searchTerm
-                  ? `No course matching "${searchTerm}". Try a different search query.`
-                  : "Course catalog is currently being updated by the administration."
-              }
-              action={
-                searchTerm ? (
-                  <Button variant="outline" size="sm" onClick={() => setSearchTerm("")}>
-                    Clear Search
-                  </Button>
-                ) : undefined
-              }
-            />
-          )}
-
-          {/* Courses grid */}
-          {!isLoading && !error && courses.length > 0 && (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-              {courses.map((course) => (
-                <Card key={course.id} className="flex flex-col justify-between shadow-xs hover:shadow-md transition-shadow">
-                  <CardHeader>
-                    <div className="flex items-center justify-between gap-2">
-                      <Badge variant="info" className="text-[10px]">
-                        {course.code}
-                      </Badge>
-                      {course.duration_months && (
-                        <div className="flex items-center gap-1 text-xs text-slate-500">
-                          <Clock className="h-3.5 w-3.5" />
-                          <span>{course.duration_months} Months</span>
-                        </div>
-                      )}
-                    </div>
-                    <CardTitle className="mt-2 text-lg">{course.name}</CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <p className="text-xs text-slate-600 line-clamp-3 leading-relaxed">
-                      {course.description || "Comprehensive hands-on training module covering foundational theory, guided laboratory practice, and assessment."}
-                    </p>
-                    <div className="mt-4 pt-4 border-t border-slate-100 flex items-center justify-between">
-                      <span className="text-xs text-slate-500">Standard Fee:</span>
-                      <span className="text-sm font-semibold text-slate-900">
-                        {course.default_fee_paise
-                          ? formatCurrency(course.default_fee_paise)
-                          : "Contact Desk"}
+            {/* Course Cards */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              {filtered.map((item) => (
+                <div
+                  key={item.code}
+                  className="rounded-2xl border border-slate-200 bg-white p-6 sm:p-7 shadow-xs hover:shadow-md transition-all flex flex-col justify-between"
+                >
+                  <div>
+                    <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                      <span className="rounded-lg bg-[#1E3A8A] text-[#FBBF24] px-3 py-1 text-xs font-black">
+                        {item.code}
+                      </span>
+                      <span className="rounded-full bg-blue-50 text-[#1E3A8A] border border-blue-200 px-3 py-1 text-xs font-extrabold">
+                        {item.monthlyFee}
                       </span>
                     </div>
-                  </CardContent>
-                  <CardFooter className="pt-0 border-t-0">
-                    <Link href={`/admissions?course=${encodeURIComponent(course.name)}`} className="w-full">
-                      <Button variant="primary" size="sm" className="w-full gap-1.5">
-                        Enquire for this Course
-                        <ArrowRight className="h-3.5 w-3.5" />
-                      </Button>
+
+                    <h2 className="text-xl font-extrabold text-slate-900 mb-2">
+                      {item.title}
+                    </h2>
+                    <p className="text-xs text-slate-600 leading-relaxed mb-4">
+                      {item.description}
+                    </p>
+
+                    <div className="flex flex-wrap items-center gap-4 text-xs text-slate-700 font-semibold mb-4 bg-slate-50 px-3.5 py-2 rounded-xl border border-slate-100">
+                      <span className="inline-flex items-center gap-1.5">
+                        <Clock className="h-3.5 w-3.5 text-[#F59E0B]" />
+                        Duration: <strong>{item.duration}</strong>
+                      </span>
+                      <span>•</span>
+                      <span>
+                        Eligibility: <strong>{item.eligibility}</strong>
+                      </span>
+                    </div>
+
+                    <div className="space-y-2 pt-3 border-t border-slate-100">
+                      {item.highlights.map((h) => (
+                        <div
+                          key={h}
+                          className="flex items-start gap-2 text-xs text-slate-700 font-medium"
+                        >
+                          <CheckCircle2 className="h-4 w-4 text-[#2563EB] shrink-0 mt-0.5" />
+                          <span>{h}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="mt-6 pt-4 border-t border-slate-100 flex items-center justify-between">
+                    <a
+                      href={RGYCSM_COURSES_URL}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 text-xs font-bold text-[#1E3A8A] hover:underline"
+                    >
+                      <span>Official RGYCSM Syllabus</span>
+                      <ExternalLink className="h-3.5 w-3.5" />
+                    </a>
+                    <Link
+                      href="/login"
+                      className="inline-flex items-center gap-1.5 rounded-xl bg-[#1E3A8A] hover:bg-[#2563EB] text-white px-4 py-2 text-xs font-extrabold transition-colors"
+                    >
+                      <span>Student Portal Login</span>
+                      <ArrowRight className="h-3.5 w-3.5 text-[#FBBF24]" />
                     </Link>
-                  </CardFooter>
-                </Card>
+                  </div>
+                </div>
               ))}
             </div>
-          )}
-        </div>
+          </div>
+        </section>
       </main>
 
       <PublicFooter />

@@ -1,95 +1,155 @@
-from typing import Annotated
+from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Header, Request, status
-from starlette.concurrency import run_in_threadpool
+from fastapi import APIRouter, Header, Request, Response, status
+from pydantic import BaseModel, ConfigDict, Field
 
-from app.dependencies import ContainerDep, CurrentUserDep, payment_service
-from app.exceptions import ValidationFailedError
-from app.models.payment import Payment, PaymentStatus
-from app.schemas.common import ApiResponse, ok
-from app.schemas.payment import (
-    IDEMPOTENCY_KEY_PATTERN,
-    CheckoutOrder,
-    CreateOrderRequest,
-    PaymentConfig,
-    PaymentResult,
-    VerifyPaymentRequest,
-    WebhookResult,
+from app.core.constants import get_active_month
+from app.dependencies import (
+    AdminDep,
+    ContainerDep,
+    CurrentUserDep,
+    payment_service,
 )
-from app.utils.pagination import PageDep, paged
+from app.schemas.common import ApiResponse, ok
+from app.utils.pagination import Page, PageDep
 from app.utils.rate_limit import client_ip
 
 router = APIRouter()
 
-MAX_WEBHOOK_BYTES = 256 * 1024
 
+class CreateOrderPayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
 
-@router.get("/config", response_model=ApiResponse[PaymentConfig])
-def checkout_config(user: CurrentUserDep, container: ContainerDep) -> ApiResponse[PaymentConfig]:
-    """Public checkout key for the frontend. Secrets are never returned."""
-    return ok(payment_service(container).config())
-
-
-@router.post(
-    "/orders", response_model=ApiResponse[CheckoutOrder], status_code=status.HTTP_201_CREATED
-)
-def create_order(
-    payload: CreateOrderRequest,
-    user: CurrentUserDep,
-    container: ContainerDep,
-    idempotency_key: Annotated[
-        str | None, Header(alias="Idempotency-Key", pattern=IDEMPOTENCY_KEY_PATTERN)
-    ] = None,
-) -> ApiResponse[CheckoutOrder]:
-    """Create (or reuse) a provider order. The amount is computed server-side from the fee."""
-    return ok(payment_service(container).create_order(user, payload, idempotency_key))
-
-
-@router.post("/verify", response_model=ApiResponse[PaymentResult])
-def verify_payment(
-    payload: VerifyPaymentRequest, user: CurrentUserDep, container: ContainerDep
-) -> ApiResponse[PaymentResult]:
-    """Verify the Checkout signature and confirm the payment with the provider."""
-    return ok(payment_service(container).verify_checkout(user, payload))
-
-
-@router.post("/webhooks/razorpay", response_model=ApiResponse[WebhookResult])
-async def razorpay_webhook(request: Request, container: ContainerDep) -> ApiResponse[WebhookResult]:
-    """Unauthenticated by design; trust comes only from the HMAC signature."""
-    container.webhook_limiter.hit(f"razorpay:{client_ip(request)}")
-    body = bytearray()
-    async for chunk in request.stream():
-        body.extend(chunk)
-        if len(body) > MAX_WEBHOOK_BYTES:
-            raise ValidationFailedError("Webhook payload is too large.", code="PAYLOAD_TOO_LARGE")
-    result = await run_in_threadpool(
-        payment_service(container).handle_webhook,
-        bytes(body),
-        request.headers.get("x-razorpay-signature"),
-        request.headers.get("x-razorpay-event-id"),
+    month_year: str | None = Field(
+        default=None,
+        description="Target billing month in YYYY-MM format (defaults to active month 2027-12)",
     )
-    return ok(result)
+    student_id: str | None = Field(
+        default=None,
+        max_length=64,
+    )
 
 
-@router.get("", response_model=ApiResponse[list[Payment]])
+class VerifyPaymentPayload(BaseModel):
+    razorpay_order_id: str = Field(min_length=4, max_length=128)
+    razorpay_payment_id: str = Field(min_length=4, max_length=128)
+    razorpay_signature: str = Field(min_length=16, max_length=256)
+
+
+class AdminRecordPaymentPayload(BaseModel):
+    student_id: str = Field(min_length=1, max_length=64)
+    month_year: str | None = Field(default=None)
+    status: str = Field(default="PAID", pattern=r"^(PAID|PENDING|FAILED|UNPAID)$")
+    amount: float | None = Field(default=None, ge=0)
+    reference: str | None = Field(default=None, max_length=120)
+
+
+@router.get("", response_model=ApiResponse[Page[dict[str, Any]]])
 def list_payments(
+    page: PageDep,
     user: CurrentUserDep,
     container: ContainerDep,
-    params: PageDep,
-    student_id: UUID | None = None,
-    fee_id: UUID | None = None,
-    status: PaymentStatus | None = None,
-) -> ApiResponse[list[Payment]]:
-    return paged(
-        payment_service(container).search(
-            user, student_id=student_id, fee_id=fee_id, status=status, params=params
+    student_id: str | None = None,
+    status: str | None = None,
+    month_year: str | None = None,
+) -> ApiResponse[Page[dict[str, Any]]]:
+    return ok(
+        payment_service(container).list_payments(
+            user,
+            page,
+            student_id=student_id,
+            status=status,
+            month_year=month_year,
         )
     )
 
 
-@router.get("/{payment_id}", response_model=ApiResponse[Payment])
+@router.post(
+    "/create-order",
+    response_model=ApiResponse[dict[str, Any]],
+    status_code=status.HTTP_201_CREATED,
+)
+def create_order(
+    payload: CreateOrderPayload,
+    user: CurrentUserDep,
+    container: ContainerDep,
+) -> ApiResponse[dict[str, Any]]:
+    container.payment_limiter.hit(f"user:{user.id}")
+    return ok(
+        payment_service(container).create_order(
+            user,
+            month_year=get_active_month(payload.month_year),
+            student_id=payload.student_id,
+        )
+    )
+
+
+@router.post("/verify", response_model=ApiResponse[dict[str, Any]])
+def verify_payment(
+    payload: VerifyPaymentPayload,
+    user: CurrentUserDep,
+    container: ContainerDep,
+) -> ApiResponse[dict[str, Any]]:
+    container.payment_limiter.hit(f"user:{user.id}")
+    return ok(
+        payment_service(container).verify_checkout(
+            user,
+            razorpay_order_id=payload.razorpay_order_id,
+            razorpay_payment_id=payload.razorpay_payment_id,
+            razorpay_signature=payload.razorpay_signature,
+        )
+    )
+
+
+@router.post("/webhooks/razorpay", response_model=ApiResponse[dict[str, Any]])
+@router.post("/webhook", response_model=ApiResponse[dict[str, Any]])
+async def razorpay_webhook(
+    request: Request,
+    container: ContainerDep,
+    x_razorpay_signature: str = Header(default="", alias="X-Razorpay-Signature"),
+) -> ApiResponse[dict[str, Any]]:
+    container.webhook_limiter.hit(f"ip:{client_ip(request)}")
+    raw_body = await request.body()
+    return ok(
+        payment_service(container).handle_webhook(
+            raw_body=raw_body, signature=x_razorpay_signature
+        )
+    )
+
+
+@router.post("/admin-record", response_model=ApiResponse[dict[str, Any]])
+def admin_record_payment(
+    payload: AdminRecordPaymentPayload,
+    user: AdminDep,
+    container: ContainerDep,
+) -> ApiResponse[dict[str, Any]]:
+    return ok(
+        payment_service(container).record_admin_payment(
+            user,
+            student_id=payload.student_id,
+            month_year=get_active_month(payload.month_year),
+            status=payload.status,
+            amount=payload.amount,
+            reference=payload.reference,
+        )
+    )
+
+
+@router.get("/{payment_id}", response_model=ApiResponse[dict[str, Any]])
 def get_payment(
     payment_id: UUID, user: CurrentUserDep, container: ContainerDep
-) -> ApiResponse[Payment]:
-    return ok(payment_service(container).get(user, payment_id))
+) -> ApiResponse[dict[str, Any]]:
+    return ok(payment_service(container).get_payment(user, payment_id))
+
+
+@router.get("/{payment_id}/receipt.pdf")
+def download_receipt_pdf(
+    payment_id: UUID, user: CurrentUserDep, container: ContainerDep
+) -> Response:
+    pdf_bytes, filename = payment_service(container).render_receipt_pdf(user, payment_id)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

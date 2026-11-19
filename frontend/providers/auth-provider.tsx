@@ -33,7 +33,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const refreshSession = useCallback(async () => {
     try {
       const u = await authApi.session();
-      setUser(u);
+      setUser(u ?? null);
     } catch {
       setUser(null);
     } finally {
@@ -44,10 +44,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     refreshSession();
 
-    // Listen to unauthorized event emitted when token is invalid and cannot be refreshed
     const handleUnauthorized = () => {
       setUser(null);
-      router.push("/login");
+      if (typeof window !== "undefined") {
+        const path = window.location.pathname;
+        if (path.startsWith("/admin") || path.startsWith("/student")) {
+          router.replace("/login");
+        }
+      }
     };
 
     window.addEventListener(UNAUTHORIZED_EVENT, handleUnauthorized);
@@ -67,7 +71,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       await authApi.logout();
     } finally {
       setUser(null);
-      router.push("/login");
+      router.replace("/login");
     }
   };
 
