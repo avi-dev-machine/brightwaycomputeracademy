@@ -8,6 +8,7 @@ import {
   LayoutDashboard,
   CreditCard,
   IdCard,
+  Images,
   LogOut,
   Menu,
   X,
@@ -15,9 +16,10 @@ import {
 import { useAuth } from "@/providers/auth-provider";
 
 const navItems = [
-  { href: "/student", label: "Dashboard & ID Card", icon: LayoutDashboard },
-  { href: "/student/fees", label: "Fee Payment Portal", icon: CreditCard },
-  { href: "/student/profile", label: "Photo & Digital ID", icon: IdCard },
+  { href: "/student", label: "My Profile & Fees", icon: LayoutDashboard },
+  { href: "/student/fees", label: "12-Month Fee Ledger", icon: CreditCard },
+  { href: "/student/profile", label: "Digital ID Card", icon: IdCard },
+  { href: "/student/albums", label: "Photo Albums", icon: Images },
 ];
 
 export function StudentLayout({ children }: { children: ReactNode }) {
@@ -40,7 +42,7 @@ export function StudentLayout({ children }: { children: ReactNode }) {
                   BRIGHTWAY
                 </span>
                 <span className="text-[10px] font-bold uppercase tracking-widest text-[#FBBF24] mt-0.5">
-                  Student Portal
+                  Student Portal (View-Only)
                 </span>
               </div>
             </Link>

@@ -6,7 +6,7 @@ from typing import Annotated
 from fastapi import Depends, Request
 
 from app.config import Settings, get_settings
-from app.core.permissions import AdminUser, StaffUser, StudentUser
+from app.core.permissions import AdminUser, StaffUser, StudentUser, SuperAdminUser
 from app.core.security import AuthenticatedUser, CurrentUser
 from app.db.client import DbConn, DbConnection
 from app.integrations.messaging import MessagingGateway, build_messaging_gateway
@@ -102,6 +102,7 @@ def report_service(c: ServiceContainer) -> ReportService:
 
 
 CurrentUserDep = AuthenticatedUser
+SuperAdminDep = SuperAdminUser
 AdminDep = AdminUser
 StaffDep = StaffUser
 StudentDep = StudentUser
@@ -113,6 +114,7 @@ __all__ = [
     "ServiceContainer",
     "StaffDep",
     "StudentDep",
+    "SuperAdminDep",
     "auth_service",
     "csv_import_service",
     "get_container",

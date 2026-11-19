@@ -1,4 +1,4 @@
-"""Role-based access control (RBAC) dependencies and ownership guards."""
+"""Three-Level Role-Based Access Control (RBAC): SUPER_ADMIN, ADMIN, and STUDENT."""
 
 from collections.abc import Callable
 from typing import Annotated
@@ -11,16 +11,13 @@ from app.core.errors import AuthorizationError
 from app.core.security import AuthenticatedUser, CurrentUser
 
 
-def require_roles(*allowed: Role) -> Callable[[CurrentUser], CurrentUser]:
+def require_strict_roles(*allowed: Role) -> Callable[[CurrentUser], CurrentUser]:
     allowed_set = set(allowed)
-    if Role.ADMIN in allowed_set or Role.SUPER_ADMIN in allowed_set:
-        allowed_set.add(Role.ADMIN)
-        allowed_set.add(Role.SUPER_ADMIN)
 
     def _check(user: AuthenticatedUser) -> CurrentUser:
         if user.role not in allowed_set:
             raise AuthorizationError(
-                f"Role {user.role.value} cannot access this resource.",
+                f"Access denied: role '{user.role.value}' is not permitted for this section.",
                 details={"required_roles": sorted(r.value for r in allowed_set)},
             )
         return user
@@ -28,9 +25,30 @@ def require_roles(*allowed: Role) -> Callable[[CurrentUser], CurrentUser]:
     return _check
 
 
-AdminUser = Annotated[CurrentUser, Depends(require_roles(Role.SUPER_ADMIN, Role.ADMIN))]
-StaffUser = Annotated[CurrentUser, Depends(require_roles(Role.SUPER_ADMIN, Role.ADMIN))]
-StudentUser = Annotated[CurrentUser, Depends(require_roles(Role.STUDENT))]
+def require_roles(*allowed: Role) -> Callable[[CurrentUser], CurrentUser]:
+    return require_strict_roles(*allowed)
+
+
+# 1. Super Admin Only (Cash Flow, Admin Management, Student Delete, System ON/OFF Settings, Photo Albums, Backups)
+SuperAdminUser = Annotated[
+    CurrentUser, Depends(require_strict_roles(Role.SUPER_ADMIN))
+]
+
+# 2. Super Admin or Restricted Admin (Fees Management, Monthly Paid/Unpaid Checks, Fee Payment Updates)
+AdminUser = Annotated[
+    CurrentUser, Depends(require_strict_roles(Role.SUPER_ADMIN, Role.ADMIN))
+]
+StaffUser = AdminUser
+
+# 3. Student Only
+StudentUser = Annotated[CurrentUser, Depends(require_strict_roles(Role.STUDENT))]
+
+
+def assert_super_admin(user: CurrentUser) -> None:
+    if user.role != Role.SUPER_ADMIN:
+        raise AuthorizationError(
+            "Only Super Admin has permission to perform this action."
+        )
 
 
 def assert_student_self_or_staff(

@@ -6,7 +6,6 @@ import { useEffect, useState, type ReactNode } from "react";
 import {
   GraduationCap,
   LayoutDashboard,
-  Users,
   CreditCard,
   Upload,
   Bell,
@@ -14,15 +13,63 @@ import {
   Menu,
   X,
   ShieldCheck,
+  Wallet,
+  FileCheck2,
+  Images,
+  Settings,
+  Lock,
 } from "lucide-react";
 import { useAuth } from "@/providers/auth-provider";
 
-const navItems = [
-  { href: "/admin", label: "Master Dashboard & Ledger", icon: LayoutDashboard },
-  { href: "/admin/students", label: "Students & ID Cards", icon: Users },
-  { href: "/admin/fees", label: "Monthly Fee Matrix", icon: CreditCard },
-  { href: "/admin/import", label: "CSV Ingestion Engine", icon: Upload },
-  { href: "/admin/notifications", label: "Notification Dispatcher", icon: Bell },
+const allNavItems = [
+  {
+    href: "/admin",
+    label: "Dashboard & Student Management",
+    icon: LayoutDashboard,
+    superAdminOnly: true,
+  },
+  {
+    href: "/admin/fees",
+    label: "Monthly Fee Management (12M)",
+    icon: CreditCard,
+    superAdminOnly: false,
+  },
+  {
+    href: "/admin/cash-flow",
+    label: "Cash Flow Management (🔒)",
+    icon: Wallet,
+    superAdminOnly: true,
+  },
+  {
+    href: "/admin/admissions",
+    label: "Online Admission Requests",
+    icon: FileCheck2,
+    superAdminOnly: true,
+  },
+  {
+    href: "/admin/albums",
+    label: "Student Photo Albums",
+    icon: Images,
+    superAdminOnly: true,
+  },
+  {
+    href: "/admin/import",
+    label: "Excel Import & Export",
+    icon: Upload,
+    superAdminOnly: true,
+  },
+  {
+    href: "/admin/notifications",
+    label: "Due Fee Reminders",
+    icon: Bell,
+    superAdminOnly: true,
+  },
+  {
+    href: "/admin/settings",
+    label: "Admins, ON/OFF & Backup",
+    icon: Settings,
+    superAdminOnly: true,
+  },
 ];
 
 export function AdminLayout({ children }: { children: ReactNode }) {
@@ -31,30 +78,39 @@ export function AdminLayout({ children }: { children: ReactNode }) {
   const router = useRouter();
   const { user, isLoading, logout } = useAuth();
 
-  const isAdmin = user?.role === "SUPER_ADMIN" || user?.role === "ADMIN";
+  const isSuperAdmin = user?.role === "SUPER_ADMIN";
+  const isRestrictedAdmin = user?.role === "ADMIN";
+  const isAnyAdmin = isSuperAdmin || isRestrictedAdmin;
 
   useEffect(() => {
-    if (!isLoading && (!user || !isAdmin)) {
-      router.replace("/login?mode=admin");
+    if (!isLoading) {
+      if (!user || !isAnyAdmin) {
+        router.replace("/login?mode=admin");
+      } else if (isRestrictedAdmin && !pathname.startsWith("/admin/fees")) {
+        router.replace("/admin/fees");
+      }
     }
-  }, [isLoading, user, isAdmin, router]);
+  }, [isLoading, user, isAnyAdmin, isRestrictedAdmin, pathname, router]);
 
-  if (isLoading || !user || !isAdmin) {
+  if (isLoading || !user || !isAnyAdmin) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-slate-50">
         <div className="flex items-center gap-3 rounded-2xl bg-white px-6 py-4 shadow-sm border border-slate-200">
           <div className="h-5 w-5 animate-spin rounded-full border-2 border-[#1E3A8A] border-t-transparent" />
           <span className="text-xs font-bold text-[#1E3A8A]">
-            Verifying Super Admin Session...
+            Verifying Administrator Session...
           </span>
         </div>
       </div>
     );
   }
 
+  const visibleNavItems = allNavItems.filter(
+    (item) => isSuperAdmin || !item.superAdminOnly
+  );
+
   return (
     <div className="flex min-h-screen bg-slate-50">
-      {/* Mobile Sidebar Backdrop */}
       {sidebarOpen && (
         <div
           className="fixed inset-0 z-40 bg-slate-900/60 backdrop-blur-xs lg:hidden"
@@ -64,12 +120,15 @@ export function AdminLayout({ children }: { children: ReactNode }) {
 
       {/* Sidebar (#1E3A8A Deep Trust Blue) */}
       <aside
-        className={`fixed inset-y-0 left-0 z-50 flex w-64 flex-col bg-[#1E3A8A] text-white transition-transform duration-200 lg:static lg:translate-x-0 ${
+        className={`fixed inset-y-0 left-0 z-50 flex w-68 flex-col bg-[#1E3A8A] text-white transition-transform duration-200 lg:static lg:translate-x-0 ${
           sidebarOpen ? "translate-x-0" : "-translate-x-full"
         }`}
       >
         <div className="flex h-16 items-center justify-between px-5 border-b border-white/10">
-          <Link href="/admin" className="flex items-center gap-3">
+          <Link
+            href={isSuperAdmin ? "/admin" : "/admin/fees"}
+            className="flex items-center gap-3"
+          >
             <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#F59E0B] text-slate-950 font-black shadow-sm">
               <GraduationCap className="h-5 w-5" />
             </div>
@@ -78,7 +137,7 @@ export function AdminLayout({ children }: { children: ReactNode }) {
                 BRIGHTWAY
               </span>
               <span className="text-[10px] font-bold uppercase tracking-widest text-[#FBBF24] mt-0.5">
-                Admin Portal
+                {isSuperAdmin ? "Super Admin Portal" : "Fees Admin Portal"}
               </span>
             </div>
           </Link>
@@ -92,11 +151,11 @@ export function AdminLayout({ children }: { children: ReactNode }) {
           </button>
         </div>
 
-        <nav className="flex-1 space-y-1 px-3 py-5">
-          {navItems.map((item) => {
+        <nav className="flex-1 space-y-1 px-3 py-5 overflow-y-auto">
+          {visibleNavItems.map((item) => {
             const isActive =
               item.href === "/admin"
-                ? pathname === "/admin"
+                ? pathname === "/admin" || pathname === "/admin/students"
                 : pathname.startsWith(item.href);
             const Icon = item.icon;
             return (
@@ -115,6 +174,18 @@ export function AdminLayout({ children }: { children: ReactNode }) {
               </Link>
             );
           })}
+
+          {isRestrictedAdmin && (
+            <div className="mt-4 rounded-xl bg-white/5 border border-white/10 p-3 text-[11px] text-blue-200 space-y-1">
+              <div className="flex items-center gap-1.5 font-extrabold text-[#FBBF24]">
+                <Lock className="h-3.5 w-3.5" />
+                <span>Restricted Admin Access</span>
+              </div>
+              <p className="leading-relaxed">
+                Your account is authorized exclusively for Monthly Fee Management. Cash Flow, Student Deletion, and Settings require Super Admin privileges.
+              </p>
+            </div>
+          )}
         </nav>
 
         <div className="border-t border-white/10 p-4 space-y-3">
@@ -122,7 +193,7 @@ export function AdminLayout({ children }: { children: ReactNode }) {
             <ShieldCheck className="h-4 w-4 text-[#FBBF24] shrink-0" />
             <div className="min-w-0 flex-1">
               <p className="truncate text-xs font-extrabold text-white">
-                {user.display_name || "Super Admin"}
+                {user.display_name || user.student_code || "Administrator"}
               </p>
               <p className="truncate text-[10px] font-mono text-[#FBBF24]">
                 ROLE: {user.role}
@@ -155,15 +226,24 @@ export function AdminLayout({ children }: { children: ReactNode }) {
             </button>
             <div>
               <h1 className="font-display text-sm sm:text-base font-extrabold text-[#1E3A8A]">
-                BRIGHTWAY COMPUTER EDUCATION — Master Administration
+                BRIGHTWAY COMPUTER EDUCATION —{" "}
+                {isSuperAdmin
+                  ? "Super Admin Management System"
+                  : "Fees Management Desk (Restricted Admin)"}
               </h1>
             </div>
           </div>
 
           <div className="flex items-center gap-3">
-            <span className="hidden sm:inline-flex items-center gap-1.5 rounded-full bg-blue-50 border border-blue-200 px-3 py-1 text-xs font-extrabold text-[#1E3A8A]">
+            <span
+              className={`hidden sm:inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-extrabold border ${
+                isSuperAdmin
+                  ? "bg-blue-50 border-blue-200 text-[#1E3A8A]"
+                  : "bg-amber-50 border-amber-200 text-amber-900"
+              }`}
+            >
               <span className="h-2 w-2 rounded-full bg-emerald-500" />
-              Active Cycle: December 2027 (2027-12)
+              {isSuperAdmin ? "SUPER ADMIN" : "FEES ADMIN"}
             </span>
           </div>
         </header>

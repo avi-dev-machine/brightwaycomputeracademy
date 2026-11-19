@@ -22,6 +22,7 @@ export const RGYCSM_COURSES_URL = "https://www.rgycsm.org/courses";
 const navItems = [
   { href: "/", label: "Home" },
   { href: "/courses", label: "RGYCSM Courses" },
+  { href: "/admissions", label: "Online Admission" },
   { href: "/about", label: "About & Affiliation" },
   { href: "/contact", label: "Campus Location" },
 ];
@@ -138,6 +139,12 @@ export function PublicHeader() {
                 className="text-xs font-bold text-slate-500 hover:text-[#1E3A8A] px-3 py-2 rounded-xl hover:bg-slate-100 transition-colors"
               >
                 Admin Login
+              </Link>
+              <Link
+                href="/admissions"
+                className="inline-flex items-center gap-1.5 rounded-xl bg-[#F59E0B] hover:bg-[#FBBF24] px-4 py-2.5 text-xs font-extrabold text-slate-950 shadow-sm transition-all"
+              >
+                <span>Online Admission Form</span>
               </Link>
               <Link
                 href="/login"

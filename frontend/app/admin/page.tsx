@@ -2,6 +2,7 @@
 
 import { useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import Link from "next/link";
 import {
   Users,
   IndianRupee,
@@ -24,6 +25,14 @@ import {
   X,
   Copy,
   Calendar,
+  Download,
+  Trash2,
+  Camera,
+  Power,
+  UserCheck,
+  UserX,
+  Wallet,
+  FileCheck2,
 } from "lucide-react";
 import { api } from "@/lib/api/client";
 import { useToast } from "@/components/ui/toast";
@@ -42,13 +51,16 @@ interface CourseStat {
 interface DashboardAnalytics {
   active_month: string;
   active_month_label?: string;
-  available_months?: Array<{ month_year: string; month_label: string }>;
+  year?: number;
   selected_batch: string;
   total_students: number;
+  active_students: number;
+  inactive_students: number;
   assigned_id_count?: number;
   missing_id_count?: number;
   paid_students_count: number;
   unpaid_students_count: number;
+  pending_admissions_count?: number;
   monthly_revenue_collected: number;
   monthly_pending_dues: number;
   expected_monthly_revenue: number;
@@ -63,15 +75,22 @@ interface StudentRow {
   has_student_id: boolean;
   password: string;
   initial_passcode: string;
+  parent_name?: string;
+  dob?: string;
   contact_number: string;
+  address?: string;
   course: string;
   batch: string;
+  admission_date?: string;
   monthly_fee: number;
   fee_status: "PAID" | "UNPAID";
   current_month_status: "PAID" | "UNPAID";
   month: string;
   current_month: string;
   month_label: string;
+  photo_url?: string | null;
+  active: boolean;
+  status: "ACTIVE" | "INACTIVE";
 }
 
 interface PaginatedStudents {
@@ -84,61 +103,106 @@ interface PaginatedStudents {
   };
 }
 
-const MONTH_OPTIONS = [
-  { value: "2027-12", label: "December 2027 (2027-12)" },
-  { value: "2028-01", label: "January 2028 (2028-01)" },
-  { value: "2028-02", label: "February 2028 (2028-02)" },
+interface SystemSettingsFlags {
+  online_admissions_enabled: boolean;
+  online_fee_payment_enabled: boolean;
+  student_id_download_enabled: boolean;
+  photo_albums_visible_to_students: boolean;
+  fee_reminders_enabled: boolean;
+}
+
+const MONTHS_LIST = [
+  { num: "01", name: "January" },
+  { num: "02", name: "February" },
+  { num: "03", name: "March" },
+  { num: "04", name: "April" },
+  { num: "05", name: "May" },
+  { num: "06", name: "June" },
+  { num: "07", name: "July" },
+  { num: "08", name: "August" },
+  { num: "09", name: "September" },
+  { num: "10", name: "October" },
+  { num: "11", name: "November" },
+  { num: "12", name: "December" },
 ];
 
 export default function AdminDashboardPage() {
+  const [selectedYear, setSelectedYear] = useState<string>("2027");
+  const [selectedMonthNum, setSelectedMonthNum] = useState<string>("12");
+  const activeMonth = `${selectedYear}-${selectedMonthNum}`;
+
   const [selectedCourse, setSelectedCourse] = useState<string>("ALL");
-  const [activeMonth, setActiveMonth] = useState<string>("2027-12");
   const [statusFilter, setStatusFilter] = useState<string>("ALL");
+  const [activeStatusFilter, setActiveStatusFilter] = useState<string>("ALL");
   const [idFilter, setIdFilter] = useState<string>("ALL");
   const [search, setSearch] = useState<string>("");
   const [page, setPage] = useState<number>(1);
-  const [isUploadingCsv, setIsUploadingCsv] = useState(false);
+  const [isUploadingExcel, setIsUploadingExcel] = useState(false);
   const [isSendingBulk, setIsSendingBulk] = useState(false);
   const [sendingRowId, setSendingRowId] = useState<string | null>(null);
   const [togglingRowId, setTogglingRowId] = useState<string | null>(null);
+  const [togglingActiveId, setTogglingActiveId] = useState<string | null>(null);
 
-  // Add Student Modal/Form state
+  // Add Student Modal/Form state (Complete Section 4 fields)
   const [showAddForm, setShowAddForm] = useState(false);
   const [newName, setNewName] = useState("");
   const [newStudentId, setNewStudentId] = useState("");
   const [newPassword, setNewPassword] = useState("");
+  const [newParentName, setNewParentName] = useState("");
+  const [newDob, setNewDob] = useState("");
   const [newContact, setNewContact] = useState("");
+  const [newAddress, setNewAddress] = useState("");
   const [newCourse, setNewCourse] = useState("ADOAP");
+  const [newAdmissionDate, setNewAdmissionDate] = useState("2027-12-01");
   const [newFee, setNewFee] = useState("600");
   const [newFeeStatus, setNewFeeStatus] = useState<"UNPAID" | "PAID">("UNPAID");
+  const [newActive, setNewActive] = useState<boolean>(true);
+  const [newPhotoDataUrl, setNewPhotoDataUrl] = useState<string | null>(null);
 
-  // Edit Student Modal/Inline state
+  // Edit Student Modal state
   const [editingStudent, setEditingStudent] = useState<StudentRow | null>(null);
   const [editName, setEditName] = useState("");
   const [editStudentId, setEditStudentId] = useState("");
   const [editPassword, setEditPassword] = useState("");
+  const [editParentName, setEditParentName] = useState("");
+  const [editDob, setEditDob] = useState("");
   const [editContact, setEditContact] = useState("");
+  const [editAddress, setEditAddress] = useState("");
   const [editCourse, setEditCourse] = useState("");
+  const [editAdmissionDate, setEditAdmissionDate] = useState("2027-01-01");
   const [editFee, setEditFee] = useState("");
   const [editFeeStatus, setEditFeeStatus] = useState<"PAID" | "UNPAID">("UNPAID");
+  const [editActive, setEditActive] = useState<boolean>(true);
+  const [editPhotoDataUrl, setEditPhotoDataUrl] = useState<string | null>(null);
   const [isSavingEdit, setIsSavingEdit] = useState(false);
 
-  const csvInputRef = useRef<HTMLInputElement | null>(null);
+  const excelInputRef = useRef<HTMLInputElement | null>(null);
+  const addPhotoInputRef = useRef<HTMLInputElement | null>(null);
+  const editPhotoInputRef = useRef<HTMLInputElement | null>(null);
   const queryClient = useQueryClient();
   const { toast } = useToast();
 
-  // 1. Master Analytics Query (`/api/v1/admin/dashboard`)
+  // 1. Master Analytics Query
   const { data: analytics, isLoading: loadingAnalytics } =
     useQuery<DashboardAnalytics>({
-      queryKey: ["admin", "dashboard", activeMonth, selectedCourse],
+      queryKey: [
+        "admin",
+        "dashboard",
+        activeMonth,
+        selectedCourse,
+        activeStatusFilter,
+      ],
       queryFn: () =>
         api.get<DashboardAnalytics>("/v1/admin/dashboard", {
           month: activeMonth,
           ...(selectedCourse !== "ALL" ? { course: selectedCourse } : {}),
+          ...(activeStatusFilter !== "ALL"
+            ? { active_status: activeStatusFilter }
+            : {}),
         }),
     });
 
-  // 2. Clean Student Records Query (`/api/v1/admin/students`)
+  // 2. Student Records Query
   const { data: studentsPage, isLoading: loadingStudents } =
     useQuery<PaginatedStudents>({
       queryKey: [
@@ -147,6 +211,7 @@ export default function AdminDashboardPage() {
         activeMonth,
         selectedCourse,
         statusFilter,
+        activeStatusFilter,
         idFilter,
         search,
         page,
@@ -156,6 +221,8 @@ export default function AdminDashboardPage() {
           month: activeMonth,
           course: selectedCourse !== "ALL" ? selectedCourse : undefined,
           fee_status: statusFilter !== "ALL" ? statusFilter : undefined,
+          active_status:
+            activeStatusFilter !== "ALL" ? activeStatusFilter : undefined,
           id_status: idFilter !== "ALL" ? idFilter : undefined,
           search: search.trim() || undefined,
           page,
@@ -163,8 +230,59 @@ export default function AdminDashboardPage() {
         }),
     });
 
+  // 3. System ON/OFF Settings Query (Section 12)
+  const { data: sysSettings } = useQuery<SystemSettingsFlags>({
+    queryKey: ["admin", "settings"],
+    queryFn: () => api.get<SystemSettingsFlags>("/v1/admin/settings"),
+  });
+
   const refreshAll = () => {
     queryClient.invalidateQueries({ queryKey: ["admin"] });
+  };
+
+  const handleToggleSystemFlag = async (
+    key: keyof SystemSettingsFlags,
+    currentVal: boolean
+  ) => {
+    try {
+      await api.put("/v1/admin/settings", { [key]: !currentVal });
+      toast({
+        type: "success",
+        title: `Turned ${!currentVal ? "ON" : "OFF"}`,
+        description: `Updated ${key.replace(/_/g, " ")}.`,
+      });
+      refreshAll();
+    } catch (err) {
+      toast({
+        type: "error",
+        title: "Setting Update Failed",
+        description:
+          err instanceof Error ? err.message : "Could not toggle setting.",
+      });
+    }
+  };
+
+  const handlePhotoFileSelect = (
+    e: React.ChangeEvent<HTMLInputElement>,
+    setter: (val: string | null) => void
+  ) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > 2 * 1024 * 1024) {
+      toast({
+        type: "error",
+        title: "File Too Large",
+        description: "Photograph must be 2 MB or smaller.",
+      });
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        setter(reader.result);
+      }
+    };
+    reader.readAsDataURL(file);
   };
 
   const openEditModal = (st: StudentRow) => {
@@ -172,10 +290,16 @@ export default function AdminDashboardPage() {
     setEditName(st.name);
     setEditStudentId(st.student_id || "");
     setEditPassword(st.password || st.initial_passcode || "");
+    setEditParentName(st.parent_name || "");
+    setEditDob(st.dob || "");
     setEditContact(st.contact_number || "");
+    setEditAddress(st.address || "");
     setEditCourse(st.course || st.batch || "GENERAL");
+    setEditAdmissionDate(st.admission_date || "2027-01-01");
     setEditFee(String(st.monthly_fee ?? 600));
     setEditFeeStatus(st.fee_status || st.current_month_status || "UNPAID");
+    setEditActive(st.active !== false);
+    setEditPhotoDataUrl(null);
   };
 
   const handleSaveEdit = async (e: React.FormEvent) => {
@@ -187,16 +311,23 @@ export default function AdminDashboardPage() {
         name: editName.trim(),
         student_id: editStudentId.trim().toUpperCase(),
         password: editPassword.trim(),
+        parent_name: editParentName.trim(),
+        dob: editDob,
         contact_number: editContact.trim(),
+        address: editAddress.trim(),
         course: editCourse.trim().toUpperCase(),
+        admission_date: editAdmissionDate,
         monthly_fee: Number(editFee) || 600,
         fee_status: editFeeStatus,
         month: activeMonth,
+        active: editActive,
+        status: editActive ? "ACTIVE" : "INACTIVE",
+        ...(editPhotoDataUrl ? { photo_data_url: editPhotoDataUrl } : {}),
       });
       toast({
         type: "success",
         title: "Student Record Updated",
-        description: `Saved ${editName} (${editStudentId || "Unassigned ID"}) for ${activeMonth}.`,
+        description: `Saved ${editName} (${editStudentId || "Unassigned ID"}).`,
       });
       setEditingStudent(null);
       refreshAll();
@@ -219,11 +350,18 @@ export default function AdminDashboardPage() {
         name: newName.trim(),
         student_id: newStudentId.trim().toUpperCase(),
         password: newPassword.trim() || undefined,
+        parent_name: newParentName.trim(),
+        dob: newDob,
         contact_number: newContact.trim(),
+        address: newAddress.trim(),
         course: newCourse.trim().toUpperCase() || "GENERAL",
+        admission_date: newAdmissionDate,
         monthly_fee: Number(newFee) || 600,
         fee_status: newFeeStatus,
         month: activeMonth,
+        active: newActive,
+        status: newActive ? "ACTIVE" : "INACTIVE",
+        ...(newPhotoDataUrl ? { photo_data_url: newPhotoDataUrl } : {}),
       });
       toast({
         type: "success",
@@ -234,7 +372,11 @@ export default function AdminDashboardPage() {
       setNewName("");
       setNewStudentId("");
       setNewPassword("");
+      setNewParentName("");
+      setNewDob("");
       setNewContact("");
+      setNewAddress("");
+      setNewPhotoDataUrl(null);
       refreshAll();
     } catch (err) {
       toast({
@@ -243,6 +385,59 @@ export default function AdminDashboardPage() {
         description:
           err instanceof Error ? err.message : "Failed to create student.",
       });
+    }
+  };
+
+  const handleDeleteStudent = async (st: StudentRow) => {
+    if (
+      !window.confirm(
+        `Are you sure you want to permanently delete ${st.name} (${st.student_id || "No ID"})?`
+      )
+    ) {
+      return;
+    }
+    try {
+      await api.delete(`/v1/admin/students/${st.id}`);
+      toast({
+        type: "success",
+        title: "Student Deleted",
+        description: `Removed ${st.name} from the database.`,
+      });
+      refreshAll();
+    } catch (err) {
+      toast({
+        type: "error",
+        title: "Delete Failed",
+        description:
+          err instanceof Error ? err.message : "Could not delete student.",
+      });
+    }
+  };
+
+  // Toggle Active / Inactive Student Status (Section 11)
+  const handleToggleStudentActive = async (st: StudentRow) => {
+    setTogglingActiveId(st.id);
+    const nextActive = !(st.active !== false);
+    try {
+      await api.put(`/v1/admin/students/${st.id}`, {
+        active: nextActive,
+        status: nextActive ? "ACTIVE" : "INACTIVE",
+      });
+      toast({
+        type: "success",
+        title: `Student Marked as ${nextActive ? "ACTIVE" : "INACTIVE"}`,
+        description: `${st.name} (${st.student_id || "No ID"}) status updated.`,
+      });
+      refreshAll();
+    } catch (err) {
+      toast({
+        type: "error",
+        title: "Status Update Failed",
+        description:
+          err instanceof Error ? err.message : "Could not change status.",
+      });
+    } finally {
+      setTogglingActiveId(null);
     }
   };
 
@@ -256,6 +451,7 @@ export default function AdminDashboardPage() {
         status: nextStatus,
         month: activeMonth,
         amount: student.monthly_fee,
+        payment_mode: "CASH",
       });
       toast({
         type: "success",
@@ -275,43 +471,43 @@ export default function AdminDashboardPage() {
     }
   };
 
-  // Streaming CSV Upload Handler
-  const handleCsvUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Excel (.xlsx) & CSV Upload Handler
+  const handleExcelUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    setIsUploadingCsv(true);
+    setIsUploadingExcel(true);
     try {
       const formData = new FormData();
       formData.append("file", file);
       formData.append("dry_run", "false");
 
-      const res = await fetch("/api/backend/v1/imports/csv", {
+      const res = await fetch("/api/backend/v1/imports/excel", {
         method: "POST",
         body: formData,
       });
       const json = await res.json();
       if (!res.ok || !json.success) {
-        throw new Error(json?.error?.message || "CSV import failed.");
+        throw new Error(json?.error?.message || "Excel/CSV import failed.");
       }
 
       const d = json.data;
       toast({
         type: "success",
-        title: "CSV Imported Successfully",
-        description: `Processed ${d.total_rows} rows (${d.inserted_rows} inserted, ${d.updated_rows} updated).`,
+        title: `Excel/CSV Imported (${d.format || "File"})`,
+        description: `Processed ${d.total_rows} rows (${d.inserted_rows} inserted, ${d.updated_rows} updated, ${d.duplicate_rows || 0} duplicates).`,
       });
       refreshAll();
     } catch (err) {
       toast({
         type: "error",
-        title: "CSV Ingestion Error",
+        title: "Import Error",
         description:
-          err instanceof Error ? err.message : "Could not parse CSV file.",
+          err instanceof Error ? err.message : "Could not parse Excel/CSV file.",
       });
     } finally {
-      setIsUploadingCsv(false);
-      if (csvInputRef.current) csvInputRef.current.value = "";
+      setIsUploadingExcel(false);
+      if (excelInputRef.current) excelInputRef.current.value = "";
     }
   };
 
@@ -391,44 +587,81 @@ export default function AdminDashboardPage() {
     }
   };
 
+  const monthObj = MONTHS_LIST.find((m) => m.num === selectedMonthNum);
   const activeMonthLabel =
     analytics?.active_month_label ||
-    MONTH_OPTIONS.find((m) => m.value === activeMonth)?.label ||
-    activeMonth;
+    `${monthObj?.name || "December"} ${selectedYear}`;
 
   return (
     <div className="space-y-6">
-      {/* Top Action Header: Active Month Rollover Selector + Add Student + CSV Ingestion */}
+      {/* Top Action Header: Year & 12-Month Selector + Add Student + Excel Import/Export */}
       <div className="rounded-2xl bg-gradient-to-r from-[#1E3A8A] via-[#1E3A8A] to-[#2563EB] p-6 text-white shadow-lg">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6">
           <div>
-            <span className="inline-block rounded-full bg-[#F59E0B] text-slate-950 px-3 py-0.5 text-xs font-extrabold uppercase tracking-wider">
-              Active Month: {activeMonthLabel}
-            </span>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="inline-block rounded-full bg-[#F59E0B] text-slate-950 px-3 py-0.5 text-xs font-extrabold uppercase tracking-wider">
+                Super Admin Control Center • {activeMonthLabel}
+              </span>
+              {analytics?.pending_admissions_count ? (
+                <Link
+                  href="/admin/admissions"
+                  className="inline-flex items-center gap-1 rounded-full bg-emerald-400 text-slate-950 px-3 py-0.5 text-xs font-extrabold hover:bg-emerald-300"
+                >
+                  <FileCheck2 className="h-3.5 w-3.5" />
+                  <span>
+                    {analytics.pending_admissions_count} New Online Admission
+                    Requests
+                  </span>
+                </Link>
+              ) : null}
+            </div>
             <h2 className="mt-2 font-display text-2xl sm:text-3xl font-extrabold">
-              Brightway Computer Academy — Master Admin Portal
+              BRIGHTWAY COMPUTER EDUCATION — Management System
             </h2>
             <p className="text-xs text-blue-100 mt-1">
-              Manage student records (NAME, STUDENT ID, PASSWORD, CONTACT NO., COURSE, FEES, MONTH). When December 2027 ends and switches to January 2028, December&apos;s fee records remain safely archived in the backend.
+              Complete Student Management, 12-Month Fee Ledger, Excel (.xlsx) Import/Export, Active/Inactive Student Control, and Password-Protected Cash Flow.
             </p>
           </div>
 
-          <div className="flex flex-wrap items-center gap-3">
-            {/* Active Month Selector (Dec 2027 -> Jan 2028 Rollover) */}
-            <div className="flex items-center gap-2 rounded-xl bg-white/10 border border-white/20 px-3 py-2">
+          <div className="flex flex-wrap items-center gap-2.5">
+            {/* Year Selector */}
+            <div className="flex items-center gap-1.5 rounded-xl bg-white/10 border border-white/20 px-3 py-2">
               <Calendar className="h-4 w-4 text-[#FBBF24]" />
-              <span className="text-xs font-bold text-[#FBBF24]">Month:</span>
+              <span className="text-xs font-bold text-[#FBBF24]">Year:</span>
               <select
-                value={activeMonth}
+                value={selectedYear}
                 onChange={(e) => {
-                  setActiveMonth(e.target.value);
+                  setSelectedYear(e.target.value);
                   setPage(1);
                 }}
                 className="bg-transparent text-xs font-extrabold text-white focus:outline-hidden cursor-pointer"
               >
-                {MONTH_OPTIONS.map((m) => (
-                  <option key={m.value} value={m.value} className="text-slate-900">
-                    {m.label}
+                <option value="2026" className="text-slate-900">
+                  2026
+                </option>
+                <option value="2027" className="text-slate-900">
+                  2027
+                </option>
+                <option value="2028" className="text-slate-900">
+                  2028
+                </option>
+              </select>
+            </div>
+
+            {/* All 12 Months Selector */}
+            <div className="flex items-center gap-1.5 rounded-xl bg-white/10 border border-white/20 px-3 py-2">
+              <span className="text-xs font-bold text-[#FBBF24]">Month:</span>
+              <select
+                value={selectedMonthNum}
+                onChange={(e) => {
+                  setSelectedMonthNum(e.target.value);
+                  setPage(1);
+                }}
+                className="bg-transparent text-xs font-extrabold text-white focus:outline-hidden cursor-pointer"
+              >
+                {MONTHS_LIST.map((m) => (
+                  <option key={m.num} value={m.num} className="text-slate-900">
+                    {m.name} ({selectedYear}-{m.num})
                   </option>
                 ))}
               </select>
@@ -440,117 +673,370 @@ export default function AdminDashboardPage() {
               className="inline-flex items-center gap-1.5 rounded-xl bg-white text-[#1E3A8A] hover:bg-blue-50 px-4 py-2.5 text-xs font-extrabold shadow-md transition-colors cursor-pointer"
             >
               <Plus className="h-4 w-4" />
-              <span>{showAddForm ? "Close Form" : "Add Student"}</span>
+              <span>{showAddForm ? "Close Form" : "Add New Student"}</span>
             </button>
 
-            {/* Streaming CSV Ingestion Button */}
+            {/* Upload Excel / CSV Button */}
             <input
-              ref={csvInputRef}
+              ref={excelInputRef}
               type="file"
-              accept=".csv,text/csv"
-              onChange={handleCsvUpload}
+              accept=".xlsx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv"
+              onChange={handleExcelUpload}
               className="hidden"
             />
             <button
               type="button"
-              onClick={() => csvInputRef.current?.click()}
-              disabled={isUploadingCsv}
-              className="inline-flex items-center gap-2 rounded-xl bg-[#F59E0B] hover:bg-[#FBBF24] text-slate-950 px-4 py-2.5 text-xs font-extrabold shadow-md transition-colors cursor-pointer"
+              onClick={() => excelInputRef.current?.click()}
+              disabled={isUploadingExcel}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-[#F59E0B] hover:bg-[#FBBF24] text-slate-950 px-4 py-2.5 text-xs font-extrabold shadow-md transition-colors cursor-pointer"
             >
-              {isUploadingCsv ? (
+              {isUploadingExcel ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
               ) : (
                 <Upload className="h-4 w-4" />
               )}
-              <span>{isUploadingCsv ? "Importing..." : "Import CSV"}</span>
+              <span>
+                {isUploadingExcel ? "Uploading..." : "Upload Excel (.xlsx/.csv)"}
+              </span>
             </button>
+
+            <a
+              href={`/api/backend/v1/admin/export/students?format=xlsx&active_status=${activeStatusFilter}&course=${selectedCourse}`}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 px-4 py-2.5 text-xs font-extrabold shadow-md transition-colors"
+            >
+              <Download className="h-4 w-4" />
+              <span>Download Excel (.xlsx)</span>
+            </a>
           </div>
         </div>
       </div>
 
-      {/* Add New Student Form */}
+      {/* Section 12: Quick ON/OFF Controls & Section 7: Cash Flow Quick Access */}
+      <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-xs flex flex-wrap items-center justify-between gap-4">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <span className="inline-flex items-center gap-1.5 text-xs font-extrabold uppercase tracking-wider text-[#1E3A8A]">
+            <Power className="h-4 w-4 text-[#F59E0B]" />
+            <span>Super Admin ON/OFF Controls:</span>
+          </span>
+
+          {(
+            [
+              {
+                key: "online_admissions_enabled",
+                label: "Online Admission Form",
+              },
+              {
+                key: "online_fee_payment_enabled",
+                label: "Online Fee Payment",
+              },
+              {
+                key: "photo_albums_visible_to_students",
+                label: "Student Photo Albums",
+              },
+              {
+                key: "fee_reminders_enabled",
+                label: "Due Fee Reminders",
+              },
+            ] as const
+          ).map((flag) => {
+            const isOn = sysSettings ? sysSettings[flag.key] !== false : true;
+            return (
+              <button
+                key={flag.key}
+                type="button"
+                onClick={() => handleToggleSystemFlag(flag.key, isOn)}
+                className={`inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-extrabold border transition-all cursor-pointer ${
+                  isOn
+                    ? "bg-emerald-50 border-emerald-300 text-emerald-800 hover:bg-emerald-100"
+                    : "bg-slate-100 border-slate-300 text-slate-500 hover:bg-slate-200"
+                }`}
+              >
+                <span
+                  className={`h-2 w-2 rounded-full ${
+                    isOn ? "bg-emerald-600" : "bg-slate-400"
+                  }`}
+                />
+                <span>{flag.label}:</span>
+                <span className={isOn ? "text-emerald-900" : "text-red-600"}>
+                  {isOn ? "ON" : "OFF"}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Link
+            href="/admin/fees"
+            className="inline-flex items-center gap-1.5 rounded-xl bg-blue-50 hover:bg-blue-100 text-[#1E3A8A] px-3.5 py-2 text-xs font-extrabold transition-colors"
+          >
+            <Calendar className="h-3.5 w-3.5" />
+            <span>12-Month Fee Matrix</span>
+          </Link>
+          <Link
+            href="/admin/cash-flow"
+            className="inline-flex items-center gap-1.5 rounded-xl bg-[#1E3A8A] hover:bg-slate-900 text-[#FBBF24] px-3.5 py-2 text-xs font-extrabold transition-colors"
+          >
+            <Wallet className="h-3.5 w-3.5" />
+            <span>Cash Flow Management (🔒)</span>
+          </Link>
+        </div>
+      </div>
+
+      {/* Section 10: 7 Dashboard Statistics Cards */}
+      {loadingAnalytics || !analytics ? (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <CardSkeleton />
+          <CardSkeleton />
+          <CardSkeleton />
+          <CardSkeleton />
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-3.5">
+          {/* 1. Total Students */}
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-xs">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-bold uppercase text-slate-500">
+                Total Students
+              </span>
+              <Users className="h-4 w-4 text-[#1E3A8A]" />
+            </div>
+            <p className="mt-2 text-2xl font-black text-[#1E3A8A]">
+              {analytics.total_students.toLocaleString("en-IN")}
+            </p>
+            <p className="mt-1 text-[11px] text-slate-500">
+              {analytics.assigned_id_count ?? 0} with ID
+            </p>
+          </div>
+
+          {/* 2. Active Students */}
+          <button
+            type="button"
+            onClick={() => {
+              setActiveStatusFilter(
+                activeStatusFilter === "ACTIVE" ? "ALL" : "ACTIVE"
+              );
+              setPage(1);
+            }}
+            className={`text-left rounded-2xl border p-4 shadow-xs transition-all cursor-pointer ${
+              activeStatusFilter === "ACTIVE"
+                ? "border-2 border-emerald-600 bg-emerald-50/40"
+                : "border-emerald-200 bg-white hover:bg-emerald-50/20"
+            }`}
+          >
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-bold uppercase text-emerald-700">
+                Active Students
+              </span>
+              <UserCheck className="h-4 w-4 text-emerald-600" />
+            </div>
+            <p className="mt-2 text-2xl font-black text-emerald-700">
+              {(analytics.active_students ?? analytics.total_students).toLocaleString(
+                "en-IN"
+              )}
+            </p>
+            <p className="mt-1 text-[11px] text-emerald-700 font-semibold">
+              Click to filter Active
+            </p>
+          </button>
+
+          {/* 3. Inactive Students */}
+          <button
+            type="button"
+            onClick={() => {
+              setActiveStatusFilter(
+                activeStatusFilter === "INACTIVE" ? "ALL" : "INACTIVE"
+              );
+              setPage(1);
+            }}
+            className={`text-left rounded-2xl border p-4 shadow-xs transition-all cursor-pointer ${
+              activeStatusFilter === "INACTIVE"
+                ? "border-2 border-rose-600 bg-rose-50/40"
+                : "border-slate-200 bg-white hover:bg-rose-50/20"
+            }`}
+          >
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-bold uppercase text-slate-500">
+                Inactive Students
+              </span>
+              <UserX className="h-4 w-4 text-rose-500" />
+            </div>
+            <p className="mt-2 text-2xl font-black text-rose-600">
+              {(analytics.inactive_students ?? 0).toLocaleString("en-IN")}
+            </p>
+            <p className="mt-1 text-[11px] text-slate-500 font-semibold">
+              Click to filter Inactive
+            </p>
+          </button>
+
+          {/* 4. Total Paid Students */}
+          <div className="rounded-2xl border border-emerald-200 bg-white p-4 shadow-xs">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-bold uppercase text-emerald-700">
+                Total Paid ({selectedMonthNum}/{selectedYear.slice(2)})
+              </span>
+              <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+            </div>
+            <p className="mt-2 text-2xl font-black text-emerald-700">
+              {analytics.paid_students_count.toLocaleString("en-IN")}
+            </p>
+            <p className="mt-1 text-[11px] text-slate-500">
+              Paid for {activeMonthLabel}
+            </p>
+          </div>
+
+          {/* 5. Total Unpaid Students */}
+          <div className="rounded-2xl border border-amber-200 bg-white p-4 shadow-xs">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-bold uppercase text-amber-800">
+                Total Unpaid
+              </span>
+              <AlertCircle className="h-4 w-4 text-[#F59E0B]" />
+            </div>
+            <p className="mt-2 text-2xl font-black text-amber-700">
+              {analytics.unpaid_students_count.toLocaleString("en-IN")}
+            </p>
+            <p className="mt-1 text-[11px] text-slate-500">
+              Due for {activeMonthLabel}
+            </p>
+          </div>
+
+          {/* 6. Monthly Fee Collection */}
+          <div className="rounded-2xl border border-emerald-200 bg-white p-4 shadow-xs">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-bold uppercase text-emerald-700">
+                Monthly Collection
+              </span>
+              <IndianRupee className="h-4 w-4 text-emerald-700" />
+            </div>
+            <p className="mt-2 text-2xl font-black text-emerald-700">
+              ₹{analytics.monthly_revenue_collected.toLocaleString("en-IN")}
+            </p>
+            <p className="mt-1 text-[11px] text-slate-500">{activeMonthLabel}</p>
+          </div>
+
+          {/* 7. Pending Fee Collection */}
+          <div className="rounded-2xl border border-amber-200 bg-white p-4 shadow-xs">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] font-bold uppercase text-amber-800">
+                Pending Collection
+              </span>
+              <IndianRupee className="h-4 w-4 text-amber-700" />
+            </div>
+            <p className="mt-2 text-2xl font-black text-amber-700">
+              ₹{analytics.monthly_pending_dues.toLocaleString("en-IN")}
+            </p>
+            <p className="mt-1 text-[11px] text-slate-500">{activeMonthLabel}</p>
+          </div>
+        </div>
+      )}
+
+      {/* Add New Student Form (All Section 4 Fields + Photo Capture/Upload) */}
       {showAddForm && (
         <form
           onSubmit={handleCreateStudent}
           className="rounded-2xl border-2 border-[#2563EB]/30 bg-blue-50/50 p-6 space-y-4"
         >
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between border-b border-blue-200/60 pb-3">
             <h3 className="text-sm font-extrabold text-[#1E3A8A] uppercase tracking-wider">
-              Add New Student Record ({activeMonthLabel})
+              Add New Student Record (Complete Profile &amp; Photograph)
             </h3>
             <button
               type="button"
               onClick={() => setShowAddForm(false)}
               className="text-xs font-bold text-slate-500 hover:text-slate-800 cursor-pointer"
             >
-              Cancel
+              Close
             </button>
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-7 gap-3 items-end">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
             <div>
               <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                NAME *
+                Student Name *
               </label>
               <input
                 type="text"
                 required
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
-                placeholder="Student Name"
-                className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-medium"
+                placeholder="Full Name"
+                className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-bold"
               />
             </div>
             <div>
               <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                STUDENT ID
+                Student ID
               </label>
               <input
                 type="text"
                 value={newStudentId}
-                onChange={(e) => setNewStudentId(e.target.value)}
+                onChange={(e) => setNewStudentId(e.target.value.toUpperCase())}
                 placeholder="e.g. RG240099"
                 className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-mono font-bold"
               />
             </div>
             <div>
               <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                PASSWORD
+                Father&apos;s / Mother&apos;s Name
               </label>
               <input
                 type="text"
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-                placeholder="Auto if blank"
-                className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-mono"
+                value={newParentName}
+                onChange={(e) => setNewParentName(e.target.value)}
+                placeholder="Parent / Guardian Name"
+                className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-medium"
               />
             </div>
             <div>
               <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                CONTACT NO.
+                Contact Number
               </label>
               <input
                 type="text"
                 value={newContact}
                 onChange={(e) => setNewContact(e.target.value)}
-                placeholder="10-digit phone"
+                placeholder="10-digit mobile"
                 className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-mono"
+              />
+            </div>
+            <div className="sm:col-span-2">
+              <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                Residential Address
+              </label>
+              <input
+                type="text"
+                value={newAddress}
+                onChange={(e) => setNewAddress(e.target.value)}
+                placeholder="Complete Address"
+                className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-medium"
               />
             </div>
             <div>
               <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                COURSE
+                Course Name
               </label>
               <input
                 type="text"
                 value={newCourse}
-                onChange={(e) => setNewCourse(e.target.value)}
-                placeholder="e.g. ADOAP, DCAE"
+                onChange={(e) => setNewCourse(e.target.value.toUpperCase())}
+                placeholder="e.g. ADOAP, DCAE, DDTP"
                 className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-bold"
               />
             </div>
             <div>
               <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                FEE (₹) &amp; STATUS
+                Admission Date
+              </label>
+              <input
+                type="date"
+                value={newAdmissionDate}
+                onChange={(e) => setNewAdmissionDate(e.target.value)}
+                className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-medium"
+              />
+            </div>
+            <div>
+              <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                Monthly Fee (₹) &amp; Status
               </label>
               <div className="flex gap-1.5">
                 <input
@@ -571,27 +1057,74 @@ export default function AdminDashboardPage() {
                 </select>
               </div>
             </div>
-            <button
-              type="submit"
-              className="rounded-xl bg-[#1E3A8A] hover:bg-slate-900 text-white py-2.5 px-4 text-xs font-extrabold cursor-pointer"
-            >
-              Save Student
-            </button>
+            <div>
+              <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                Portal Password &amp; Active Status
+              </label>
+              <div className="flex gap-1.5">
+                <input
+                  type="text"
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  placeholder="Auto Password"
+                  className="w-1/2 rounded-xl border border-slate-300 bg-white px-2.5 py-2 text-xs font-mono"
+                />
+                <select
+                  value={newActive ? "ACTIVE" : "INACTIVE"}
+                  onChange={(e) => setNewActive(e.target.value === "ACTIVE")}
+                  className="w-1/2 rounded-xl border border-slate-300 bg-white px-2 py-2 text-xs font-extrabold"
+                >
+                  <option value="ACTIVE">ACTIVE</option>
+                  <option value="INACTIVE">INACTIVE</option>
+                </select>
+              </div>
+            </div>
+            <div>
+              <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                Student Photograph
+              </label>
+              <input
+                ref={addPhotoInputRef}
+                type="file"
+                accept="image/png,image/jpeg"
+                capture="user"
+                onChange={(e) => handlePhotoFileSelect(e, setNewPhotoDataUrl)}
+                className="hidden"
+              />
+              <button
+                type="button"
+                onClick={() => addPhotoInputRef.current?.click()}
+                className="w-full inline-flex items-center justify-center gap-1.5 rounded-xl border border-[#2563EB] bg-white hover:bg-blue-50 text-[#1E3A8A] py-2 px-3 text-xs font-extrabold cursor-pointer"
+              >
+                <Camera className="h-3.5 w-3.5 text-[#2563EB]" />
+                <span>
+                  {newPhotoDataUrl ? "Photo Selected ✓" : "Upload / Capture Photo"}
+                </span>
+              </button>
+            </div>
+            <div className="flex items-end">
+              <button
+                type="submit"
+                className="w-full rounded-xl bg-[#1E3A8A] hover:bg-slate-900 text-white py-2.5 px-4 text-xs font-extrabold cursor-pointer"
+              >
+                Save New Student
+              </button>
+            </div>
           </div>
         </form>
       )}
 
-      {/* Edit Student Modal */}
+      {/* Edit Student Modal (Complete Section 4 Fields + Photo Update) */}
       {editingStudent && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4 overflow-y-auto">
           <form
             onSubmit={handleSaveEdit}
-            className="w-full max-w-xl rounded-2xl bg-white p-6 shadow-2xl border border-slate-200 space-y-4"
+            className="w-full max-w-2xl rounded-2xl bg-white p-6 shadow-2xl border border-slate-200 space-y-4 my-8"
           >
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <div>
                 <span className="text-[11px] font-extrabold uppercase tracking-wider text-[#2563EB]">
-                  Edit Student Record
+                  Edit Student Profile &amp; Credentials
                 </span>
                 <h3 className="text-lg font-extrabold text-[#1E3A8A]">
                   {editingStudent.name}
@@ -606,10 +1139,10 @@ export default function AdminDashboardPage() {
               </button>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">
-                  NAME *
+                  Student Name *
                 </label>
                 <input
                   type="text"
@@ -622,7 +1155,7 @@ export default function AdminDashboardPage() {
 
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">
-                  STUDENT ID (Add or Edit)
+                  Student ID (Add or Edit)
                 </label>
                 <input
                   type="text"
@@ -635,20 +1168,20 @@ export default function AdminDashboardPage() {
 
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">
-                  PASSWORD
+                  Father&apos;s / Mother&apos;s Name
                 </label>
                 <input
                   type="text"
-                  value={editPassword}
-                  onChange={(e) => setEditPassword(e.target.value)}
-                  placeholder="Student login password"
-                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs font-mono font-bold"
+                  value={editParentName}
+                  onChange={(e) => setEditParentName(e.target.value)}
+                  placeholder="Parent's Name"
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs font-medium"
                 />
               </div>
 
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">
-                  CONTACT NO.
+                  Contact Number
                 </label>
                 <input
                   type="text"
@@ -659,9 +1192,22 @@ export default function AdminDashboardPage() {
                 />
               </div>
 
+              <div className="sm:col-span-2">
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  Residential Address
+                </label>
+                <input
+                  type="text"
+                  value={editAddress}
+                  onChange={(e) => setEditAddress(e.target.value)}
+                  placeholder="Student residential address"
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs font-medium"
+                />
+              </div>
+
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">
-                  COURSE
+                  Course Name
                 </label>
                 <input
                   type="text"
@@ -673,7 +1219,19 @@ export default function AdminDashboardPage() {
 
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">
-                  MONTHLY FEE (₹)
+                  Admission Date
+                </label>
+                <input
+                  type="date"
+                  value={editAdmissionDate}
+                  onChange={(e) => setEditAdmissionDate(e.target.value)}
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs font-medium"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  Monthly Fee (₹)
                 </label>
                 <input
                   type="number"
@@ -685,7 +1243,19 @@ export default function AdminDashboardPage() {
 
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">
-                  FEES (PAID / UNPAID)
+                  Portal Password
+                </label>
+                <input
+                  type="text"
+                  value={editPassword}
+                  onChange={(e) => setEditPassword(e.target.value)}
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs font-mono font-bold"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  Fee Status ({activeMonthLabel})
                 </label>
                 <select
                   value={editFeeStatus}
@@ -701,14 +1271,53 @@ export default function AdminDashboardPage() {
 
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">
-                  MONTH
+                  Active / Inactive Status
                 </label>
-                <input
-                  type="text"
-                  disabled
-                  value={`${activeMonthLabel} (${activeMonth})`}
-                  className="w-full rounded-xl border border-slate-200 bg-slate-100 px-3 py-2 text-xs font-bold text-slate-600"
-                />
+                <select
+                  value={editActive ? "ACTIVE" : "INACTIVE"}
+                  onChange={(e) => setEditActive(e.target.value === "ACTIVE")}
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs font-extrabold"
+                >
+                  <option value="ACTIVE">ACTIVE</option>
+                  <option value="INACTIVE">INACTIVE</option>
+                </select>
+              </div>
+
+              <div className="sm:col-span-2">
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  Update Student Photograph (PNG/JPEG, Max 2 MB)
+                </label>
+                <div className="flex items-center gap-3">
+                  <input
+                    ref={editPhotoInputRef}
+                    type="file"
+                    accept="image/png,image/jpeg"
+                    capture="user"
+                    onChange={(e) =>
+                      handlePhotoFileSelect(e, setEditPhotoDataUrl)
+                    }
+                    className="hidden"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => editPhotoInputRef.current?.click()}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-[#2563EB] bg-blue-50 hover:bg-blue-100 text-[#1E3A8A] px-4 py-2 text-xs font-extrabold cursor-pointer"
+                  >
+                    <Camera className="h-3.5 w-3.5 text-[#2563EB]" />
+                    <span>
+                      {editPhotoDataUrl
+                        ? "New Photograph Ready ✓"
+                        : "Upload / Replace Photograph"}
+                    </span>
+                  </button>
+                  {editPhotoDataUrl && (
+                    <img
+                      src={editPhotoDataUrl}
+                      alt="Preview"
+                      className="h-10 w-10 rounded-lg object-cover border border-blue-300"
+                    />
+                  )}
+                </div>
               </div>
             </div>
 
@@ -734,98 +1343,6 @@ export default function AdminDashboardPage() {
               </button>
             </div>
           </form>
-        </div>
-      )}
-
-      {/* Analytics KPI Cards */}
-      {loadingAnalytics || !analytics ? (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <CardSkeleton />
-          <CardSkeleton />
-          <CardSkeleton />
-          <CardSkeleton />
-        </div>
-      ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-xs">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
-                Total Students
-              </span>
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-50 text-[#1E3A8A]">
-                <Users className="h-5 w-5" />
-              </div>
-            </div>
-            <p className="mt-3 text-3xl font-extrabold text-[#1E3A8A]">
-              {analytics.total_students.toLocaleString("en-IN")}
-            </p>
-            <p className="mt-1 text-xs text-slate-500 font-medium">
-              <strong>{analytics.assigned_id_count ?? 0}</strong> with ID •{" "}
-              <button
-                type="button"
-                onClick={() => {
-                  setIdFilter(idFilter === "MISSING" ? "ALL" : "MISSING");
-                  setPage(1);
-                }}
-                className="text-amber-700 font-bold underline cursor-pointer"
-              >
-                {analytics.missing_id_count ?? 0} missing ID
-              </button>
-            </p>
-          </div>
-
-          <div className="rounded-2xl border border-emerald-200 bg-white p-5 shadow-xs">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-emerald-700">
-                Fees Paid ({activeMonth})
-              </span>
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-50 text-emerald-700">
-                <CheckCircle2 className="h-5 w-5" />
-              </div>
-            </div>
-            <p className="mt-3 text-3xl font-extrabold text-emerald-700">
-              ₹{analytics.monthly_revenue_collected.toLocaleString("en-IN")}
-            </p>
-            <p className="mt-1 text-xs text-slate-600 font-medium">
-              <strong>{analytics.paid_students_count}</strong> students PAID for{" "}
-              {analytics.active_month_label || activeMonth}
-            </p>
-          </div>
-
-          <div className="rounded-2xl border border-amber-200 bg-white p-5 shadow-xs">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-amber-800">
-                Fees Unpaid ({activeMonth})
-              </span>
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-50 text-[#F59E0B]">
-                <AlertCircle className="h-5 w-5" />
-              </div>
-            </div>
-            <p className="mt-3 text-3xl font-extrabold text-amber-700">
-              ₹{analytics.monthly_pending_dues.toLocaleString("en-IN")}
-            </p>
-            <p className="mt-1 text-xs text-slate-600 font-medium">
-              <strong>{analytics.unpaid_students_count}</strong> students UNPAID
-              for {analytics.active_month_label || activeMonth}
-            </p>
-          </div>
-
-          <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-xs">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
-                Backend Archived Revenue
-              </span>
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#1E3A8A] text-[#FBBF24]">
-                <IndianRupee className="h-5 w-5" />
-              </div>
-            </div>
-            <p className="mt-3 text-3xl font-extrabold text-[#1E3A8A]">
-              ₹{analytics.all_time_revenue_collected.toLocaleString("en-IN")}
-            </p>
-            <p className="mt-1 text-xs text-slate-500 font-medium">
-              Preserved across all months in MongoDB
-            </p>
-          </div>
         </div>
       )}
 
@@ -900,12 +1417,12 @@ export default function AdminDashboardPage() {
         </div>
       )}
 
-      {/* Multi-Channel Notification Dispatcher Bar */}
+      {/* Multi-Channel Due Fee Reminder Dispatcher Bar */}
       <div className="rounded-2xl border-2 border-[#F59E0B]/60 bg-amber-50/50 p-4 shadow-xs flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div className="space-y-0.5">
           <div className="flex items-center gap-2">
             <span className="rounded-lg bg-[#F59E0B] text-slate-950 px-2.5 py-0.5 text-[11px] font-extrabold uppercase">
-              Fee Reminder Dispatcher
+              Due Fee Reminder Dispatcher
             </span>
             <span className="text-xs font-bold text-slate-700">
               Month: <strong>{activeMonthLabel}</strong> • Course:{" "}
@@ -963,21 +1480,21 @@ export default function AdminDashboardPage() {
         </div>
       </div>
 
-      {/* Main Canonical Database Table: NAME, STUDENT ID, PASSWORD, CONTACT NO., COURSE, FEES (PAID/UNPAID), MONTH */}
+      {/* Main Student Database & Active Student Management Table */}
       <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs space-y-5">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-slate-100 pb-4">
           <div>
             <h2 className="font-display text-xl font-extrabold text-[#1E3A8A]">
-              Student Database &amp; Fee Status ({activeMonthLabel})
+              Student Database &amp; Active Student Management ({activeMonthLabel})
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Columns: <strong>NAME, STUDENT ID, PASSWORD, CONTACT NO., COURSE, FEES (PAID/UNPAID), MONTH</strong>. Click <strong>Edit / Add ID</strong> on any row to add missing Student IDs or edit details.
+              Manage Student ID, Password, Parent Name, Contact, Course, Active/Inactive Status, and {activeMonthLabel} Fees.
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
             {/* Search Input */}
-            <div className="relative min-w-[230px]">
+            <div className="relative min-w-[220px]">
               <Search className="h-4 w-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
@@ -986,9 +1503,36 @@ export default function AdminDashboardPage() {
                   setSearch(e.target.value);
                   setPage(1);
                 }}
-                placeholder="Search Name, ID, Phone, Course..."
+                placeholder="Search Name, Student ID, Phone..."
                 className="w-full rounded-xl border border-slate-300 pl-9 pr-3 py-2 text-xs font-medium focus:border-[#2563EB] focus:outline-hidden"
               />
+            </div>
+
+            {/* Section 11: Dedicated Active / Inactive Student Filter Button */}
+            <div className="flex rounded-xl bg-slate-100 p-1 border border-slate-200">
+              {(
+                [
+                  { key: "ALL", label: "All Status" },
+                  { key: "ACTIVE", label: "Active Only" },
+                  { key: "INACTIVE", label: "Inactive" },
+                ] as const
+              ).map((item) => (
+                <button
+                  key={item.key}
+                  type="button"
+                  onClick={() => {
+                    setActiveStatusFilter(item.key);
+                    setPage(1);
+                  }}
+                  className={`rounded-lg px-2.5 py-1.5 text-xs font-extrabold transition-colors cursor-pointer ${
+                    activeStatusFilter === item.key
+                      ? "bg-emerald-700 text-white"
+                      : "text-slate-600 hover:text-slate-900"
+                  }`}
+                >
+                  {item.label}
+                </button>
+              ))}
             </div>
 
             {/* Student ID Filter (All / Assigned / Missing ID) */}
@@ -1049,16 +1593,19 @@ export default function AdminDashboardPage() {
               <table className="w-full text-left text-xs border-collapse">
                 <thead className="bg-[#1E3A8A] text-white uppercase">
                   <tr>
-                    <th className="py-3.5 px-4 font-extrabold">NAME</th>
-                    <th className="py-3.5 px-4 font-extrabold">STUDENT ID</th>
-                    <th className="py-3.5 px-4 font-extrabold">PASSWORD</th>
-                    <th className="py-3.5 px-4 font-extrabold">CONTACT NO.</th>
-                    <th className="py-3.5 px-4 font-extrabold">COURSE</th>
-                    <th className="py-3.5 px-4 font-extrabold text-center">
+                    <th className="py-3.5 px-3.5 font-extrabold">NAME</th>
+                    <th className="py-3.5 px-3.5 font-extrabold">STUDENT ID</th>
+                    <th className="py-3.5 px-3.5 font-extrabold">PASSWORD</th>
+                    <th className="py-3.5 px-3.5 font-extrabold">CONTACT NO.</th>
+                    <th className="py-3.5 px-3.5 font-extrabold">COURSE</th>
+                    <th className="py-3.5 px-3.5 font-extrabold text-center">
                       FEES (PAID / UNPAID)
                     </th>
-                    <th className="py-3.5 px-4 font-extrabold">MONTH</th>
-                    <th className="py-3.5 px-4 text-right font-extrabold">
+                    <th className="py-3.5 px-3.5 font-extrabold">MONTH</th>
+                    <th className="py-3.5 px-3.5 font-extrabold text-center">
+                      ACTIVE STATUS
+                    </th>
+                    <th className="py-3.5 px-3.5 text-right font-extrabold">
                       EDIT / ACTIONS
                     </th>
                   </tr>
@@ -1068,16 +1615,30 @@ export default function AdminDashboardPage() {
                     const isPaid =
                       (st.fee_status || st.current_month_status) === "PAID";
                     const isToggling = togglingRowId === st.id;
+                    const isTogglingAct = togglingActiveId === st.id;
+                    const isActiveStudent = st.active !== false;
                     const pwd = st.password || st.initial_passcode;
                     return (
-                      <tr key={st.id} className="hover:bg-blue-50/40">
+                      <tr
+                        key={st.id}
+                        className={`hover:bg-blue-50/40 ${
+                          !isActiveStudent ? "bg-slate-50/80 opacity-75" : ""
+                        }`}
+                      >
                         {/* 1. NAME */}
-                        <td className="py-3 px-4 font-extrabold text-slate-900">
-                          {st.name}
+                        <td className="py-3 px-3.5">
+                          <p className="font-extrabold text-slate-900">
+                            {st.name}
+                          </p>
+                          {st.parent_name && (
+                            <p className="text-[10px] text-slate-500">
+                              Guardian: {st.parent_name}
+                            </p>
+                          )}
                         </td>
 
                         {/* 2. STUDENT ID */}
-                        <td className="py-3 px-4">
+                        <td className="py-3 px-3.5">
                           {st.student_id ? (
                             <span className="font-mono font-extrabold text-[#1E3A8A] bg-blue-50 px-2.5 py-1 rounded-lg">
                               {st.student_id}
@@ -1095,7 +1656,7 @@ export default function AdminDashboardPage() {
                         </td>
 
                         {/* 3. PASSWORD */}
-                        <td className="py-3 px-4">
+                        <td className="py-3 px-3.5">
                           <button
                             type="button"
                             onClick={() => {
@@ -1114,7 +1675,7 @@ export default function AdminDashboardPage() {
                         </td>
 
                         {/* 4. CONTACT NO. */}
-                        <td className="py-3 px-4 font-mono text-slate-700">
+                        <td className="py-3 px-3.5 font-mono text-slate-700">
                           {st.contact_number &&
                           st.contact_number !== "0000000000" ? (
                             st.contact_number
@@ -1124,50 +1685,74 @@ export default function AdminDashboardPage() {
                         </td>
 
                         {/* 5. COURSE */}
-                        <td className="py-3 px-4">
+                        <td className="py-3 px-3.5">
                           <span className="inline-block rounded-lg bg-blue-50 text-[#1E3A8A] px-2.5 py-1 text-[11px] font-extrabold">
                             {st.course || st.batch}
                           </span>
                         </td>
 
                         {/* 6. FEES (PAID / UNPAID) */}
-                        <td className="py-3 px-4 text-center">
-                          <div className="flex flex-col items-center gap-1">
-                            <button
-                              type="button"
-                              disabled={isToggling}
-                              onClick={() => handleToggleFeeStatus(st)}
-                              title="Click to toggle PAID / UNPAID"
-                              className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-[11px] font-extrabold transition-all cursor-pointer ${
-                                isPaid
-                                  ? "bg-emerald-100 text-emerald-800 hover:bg-emerald-200"
-                                  : "bg-red-100 text-red-800 hover:bg-red-200"
-                              }`}
-                            >
-                              {isToggling ? (
-                                <Loader2 className="h-3 w-3 animate-spin" />
-                              ) : isPaid ? (
-                                <CheckCircle2 className="h-3 w-3" />
-                              ) : (
-                                <AlertCircle className="h-3 w-3" />
-                              )}
-                              <span>
-                                {isPaid ? "PAID" : "UNPAID"} • ₹
-                                {Number(st.monthly_fee).toFixed(0)}
-                              </span>
-                            </button>
-                          </div>
+                        <td className="py-3 px-3.5 text-center">
+                          <button
+                            type="button"
+                            disabled={isToggling}
+                            onClick={() => handleToggleFeeStatus(st)}
+                            title="Click to toggle PAID / UNPAID"
+                            className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-[11px] font-extrabold transition-all cursor-pointer ${
+                              isPaid
+                                ? "bg-emerald-100 text-emerald-800 hover:bg-emerald-200"
+                                : "bg-red-100 text-red-800 hover:bg-red-200"
+                            }`}
+                          >
+                            {isToggling ? (
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                            ) : isPaid ? (
+                              <CheckCircle2 className="h-3 w-3" />
+                            ) : (
+                              <AlertCircle className="h-3 w-3" />
+                            )}
+                            <span>
+                              {isPaid ? "PAID" : "UNPAID"} • ₹
+                              {Number(st.monthly_fee).toFixed(0)}
+                            </span>
+                          </button>
                         </td>
 
                         {/* 7. MONTH */}
-                        <td className="py-3 px-4">
+                        <td className="py-3 px-3.5">
                           <span className="inline-flex items-center gap-1 rounded-lg bg-amber-50 text-amber-950 border border-amber-200 px-2.5 py-1 text-[11px] font-extrabold">
                             {st.month_label || activeMonthLabel}
                           </span>
                         </td>
 
-                        {/* 8. EDIT / ACTIONS */}
-                        <td className="py-3 px-4 text-right">
+                        {/* 8. ACTIVE / INACTIVE STATUS TOGGLE */}
+                        <td className="py-3 px-3.5 text-center">
+                          <button
+                            type="button"
+                            disabled={isTogglingAct}
+                            onClick={() => handleToggleStudentActive(st)}
+                            title="Click to toggle Active / Inactive status"
+                            className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[10px] font-extrabold cursor-pointer ${
+                              isActiveStudent
+                                ? "bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100"
+                                : "bg-slate-200 text-slate-600 hover:bg-slate-300"
+                            }`}
+                          >
+                            <span
+                              className={`h-1.5 w-1.5 rounded-full ${
+                                isActiveStudent
+                                  ? "bg-emerald-600"
+                                  : "bg-slate-500"
+                              }`}
+                            />
+                            <span>
+                              {isActiveStudent ? "ACTIVE" : "INACTIVE"}
+                            </span>
+                          </button>
+                        </td>
+
+                        {/* 9. EDIT / ACTIONS */}
+                        <td className="py-3 px-3.5 text-right">
                           <div className="inline-flex items-center justify-end gap-1.5">
                             <button
                               type="button"
@@ -1218,6 +1803,15 @@ export default function AdminDashboardPage() {
                             >
                               <IdCard className="h-3.5 w-3.5" />
                             </a>
+
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteStudent(st)}
+                              title="Delete Student"
+                              className="rounded-lg border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 p-1.5 transition-colors cursor-pointer"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
                           </div>
                         </td>
                       </tr>

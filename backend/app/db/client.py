@@ -122,12 +122,28 @@ def get_active_database(settings: Settings | None = None) -> Any:
 
 def init_pool(settings: Settings | None = None) -> Any:
     db = get_active_database(settings)
-    # Auto-seed if empty
+    # Auto-seed if empty and ensure both SUPER_ADMIN (BWADMIN) and restricted ADMIN (FEESADMIN) exist
     try:
         if db["students"].count_documents({}) == 0 or db["admins"].count_documents({}) == 0:
             from scripts.populate_database import seed_database
 
             seed_database(db)
+        else:
+            from datetime import UTC, datetime
+            from uuid import uuid4
+            from app.core.passwords import hash_password
+
+            if not db["admins"].find_one({"username": "FEESADMIN"}):
+                db["admins"].insert_one(
+                    {
+                        "id": str(uuid4()),
+                        "username": "FEESADMIN",
+                        "password_hash": hash_password("Brightway@Fees2026!"),
+                        "role": "ADMIN",
+                        "display_name": "Fees Management Admin",
+                        "created_at": datetime.now(tz=UTC),
+                    }
+                )
     except Exception as exc:
         logger.warning("Auto-seed check warning: %s", exc)
     return db

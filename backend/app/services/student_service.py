@@ -1,15 +1,20 @@
-"""Student profile, photo upload, admin inline editing, and active-month fee status service (MongoDB Atlas).
+"""Student profile, photo upload, active/inactive status, and 12-month fee ledger service.
 
-Canonical Student Schema:
-  NAME (`name`)
-  STUDENT ID (`student_id` - can be assigned/edited by Admin if blank in CSV)
-  PASSWORD (`password` - stored & editable by Admin)
-  CONTACT NO. (`contact_number`)
-  COURSE (`course` / `batch`)
-  FEES (`monthly_fee` & `fee_status`: PAID | UNPAID)
-  MONTH (`month` - e.g. '2027-12' / 'December 2027')
+Includes all Section 4 fields:
+  - Student ID (`student_id`)
+  - Student Name (`name`)
+  - Father's/Mother's Name (`parent_name`)
+  - Date of Birth (`dob`)
+  - Contact Number (`contact_number`)
+  - Address (`address`)
+  - Course Name (`course` / `batch`)
+  - Admission Date (`admission_date`)
+  - Monthly Fee (`monthly_fee`)
+  - Student Photograph (`photo_url`)
+  - Active/Inactive Status (`active`: bool, `status`: 'ACTIVE' | 'INACTIVE')
 """
 
+import base64
 import io
 import re
 import time
@@ -20,10 +25,9 @@ from uuid import UUID, uuid4
 
 from PIL import Image, ImageDraw, ImageOps
 from pymongo import ASCENDING, ReturnDocument
-from pymongo.database import Database as MongoDatabase
 from pymongo.errors import DuplicateKeyError
 
-from app.core.constants import format_month_label, get_active_month
+from app.core.constants import MONTH_NAMES, format_month_label, get_active_month
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.passwords import generate_student_passcode
 from app.core.permissions import assert_student_self_or_staff
@@ -83,7 +87,7 @@ def _render_fallback_avatar(name: str, student_id: str) -> bytes:
     )
     draw.text((165, 155), initials, fill=(255, 255, 255))
     draw.text((135, 310), student_id or "UNASSIGNED", fill=(226, 232, 240))
-    draw.text((115, 440), "BRIGHTWAY ACADEMY", fill=(15, 23, 42))
+    draw.text((105, 440), "BRIGHTWAY EDUCATION", fill=(15, 23, 42))
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
@@ -92,7 +96,7 @@ def _render_fallback_avatar(name: str, student_id: str) -> bytes:
 class StudentService:
     def __init__(
         self,
-        conn: MongoDatabase[dict[str, Any]],
+        conn: Any,
         storage: StorageProvider | None = None,
     ) -> None:
         self._db = conn
@@ -125,6 +129,8 @@ class StudentService:
         month_year: str,
         status: str,
         amount: float,
+        payment_mode: str = "CASH",
+        received_by: str = "Admin",
     ) -> None:
         norm_status = status.strip().upper()
         if norm_status == "PAID":
@@ -137,12 +143,14 @@ class StudentService:
                         "amount": amount,
                         "month_year": month_year,
                         "status": "PAID",
+                        "payment_mode": payment_mode,
+                        "received_by": received_by,
                         "payment_date": datetime.now(tz=UTC),
                     },
                     "$setOnInsert": {
                         "id": str(uuid4()),
                         "razorpay_order_id": None,
-                        "razorpay_payment_id": f"ADMIN-{month_year}",
+                        "razorpay_payment_id": f"{payment_mode}-{month_year}-{uuid4().hex[:6].upper()}",
                     },
                 },
                 upsert=True,
@@ -169,10 +177,22 @@ class StudentService:
         active_month: str | None = None,
     ) -> dict[str, Any]:
         resolved_month = get_active_month(active_month)
+        year_prefix = resolved_month.split("-")[0] if "-" in resolved_month else "2027"
         student_uuid_str = str(row["id"])
         student_code: str = row.get("student_id") or ""
         course: str = row.get("course") or row.get("batch") or "GENERAL"
         contact: str = row.get("contact_number") or ""
+        parent_name: str = row.get("parent_name") or ""
+        dob: str = row.get("dob") or ""
+        address: str = row.get("address") or ""
+        admission_date: str = str(row.get("admission_date") or "2027-01-01")[:10]
+        is_active: bool = (
+            bool(row["active"])
+            if "active" in row and row["active"] is not None
+            else (str(row.get("status", "ACTIVE")).upper() != "INACTIVE")
+        )
+        active_status_str = "ACTIVE" if is_active else "INACTIVE"
+
         monthly_fee = Decimal(str(row.get("monthly_fee", 600))).quantize(
             Decimal("0.01")
         )
@@ -202,13 +222,23 @@ class StudentService:
                     Decimal("0.01")
                 )
                 p_date = p.get("payment_date")
+                p_mode = p.get("payment_mode") or (
+                    "RAZORPAY"
+                    if str(p.get("razorpay_payment_id") or "").startswith("pay_")
+                    else "CASH"
+                )
                 p_dict = {
                     "id": str(p["id"]),
                     "student_id": student_code or p.get("student_id", ""),
+                    "student_name": row["name"],
+                    "course": course,
                     "amount": float(amt),
                     "amount_paise": int(amt * 100),
                     "month_year": p["month_year"],
                     "month_label": format_month_label(p["month_year"]),
+                    "payment_mode": p_mode,
+                    "method": p_mode,
+                    "received_by": p.get("received_by") or "Online Razorpay",
                     "razorpay_order_id": p.get("razorpay_order_id"),
                     "razorpay_payment_id": p.get("razorpay_payment_id"),
                     "status": p["status"],
@@ -226,9 +256,10 @@ class StudentService:
             else "UNPAID"
         )
 
-        # Build clean ledger starting from active month + any historical months stored in backend
-        all_months = sorted(
-            {resolved_month, *payments_by_month.keys()}, reverse=True
+        # Build full 12-month ledger for the active year (Jan through Dec) + any extra paid months
+        twelve_months = [f"{year_prefix}-{m:02d}" for m in range(1, 13)]
+        all_months = list(
+            dict.fromkeys([*twelve_months, *sorted(payments_by_month.keys())])
         )
         monthly_ledger: list[dict[str, Any]] = []
         for m_key in all_months:
@@ -237,15 +268,19 @@ class StudentService:
                 "PAID" if (existing and existing["status"] == "PAID") else "UNPAID"
             )
             amt_val = existing["amount"] if existing else monthly_fee_float
+            m_num = m_key.split("-")[1] if "-" in m_key else "12"
             monthly_ledger.append(
                 {
                     "month_year": m_key,
                     "month_label": format_month_label(m_key),
-                    "month_short": format_month_label(m_key)[:3],
+                    "month_short": MONTH_NAMES.get(m_num, m_key)[:3],
                     "amount": amt_val,
                     "amount_paise": int(Decimal(str(amt_val)) * 100),
                     "status": status_val,
                     "is_current_month": m_key == resolved_month,
+                    "payment_id": existing["id"] if existing else None,
+                    "payment_mode": existing["payment_mode"] if existing else None,
+                    "received_by": existing["received_by"] if existing else None,
                     "razorpay_order_id": (
                         existing["razorpay_order_id"] if existing else None
                     ),
@@ -272,11 +307,15 @@ class StudentService:
             "has_student_id": bool(student_code),
             "password": stored_password,
             "initial_passcode": stored_password,
+            "parent_name": parent_name,
+            "dob": dob,
             "contact_number": contact,
             "phone": contact,
+            "address": address,
             "course": course,
             "batch": course,
             "batch_name": course,
+            "admission_date": admission_date,
             "monthly_fee": monthly_fee_float,
             "monthly_fee_paise": monthly_fee_paise,
             "fee_status": current_month_status,
@@ -285,8 +324,9 @@ class StudentService:
             "current_month": resolved_month,
             "month_label": format_month_label(resolved_month),
             "photo_url": row.get("photo_url"),
+            "active": is_active,
+            "status": active_status_str,
             "created_at": created_iso,
-            "active": True,
             "fee_payments": payments_list,
             "monthly_ledger": monthly_ledger,
         }
@@ -300,12 +340,20 @@ class StudentService:
         )
         return self._build_student_payload(row, include_payments=True)
 
-    def get_me(self, actor: CurrentUser) -> dict[str, Any]:
+    def get_me(
+        self, actor: CurrentUser, *, year: int | None = None
+    ) -> dict[str, Any]:
         if actor.student_id:
             row = self._fetch_raw_student(actor.student_id)
         else:
             row = self._fetch_raw_student(actor.id)
-        return self._build_student_payload(row, include_payments=True)
+        active_m = get_active_month()
+        if year is not None:
+            m_part = active_m.split("-")[1] if "-" in active_m else "12"
+            active_m = f"{year}-{m_part}"
+        return self._build_student_payload(
+            row, include_payments=True, active_month=active_m
+        )
 
     def list(
         self,
@@ -316,10 +364,11 @@ class StudentService:
         course: str | None = None,
         fee_status: str | None = None,
         id_status: str | None = None,
+        active_status: str | None = None,
         month_year: str | None = None,
     ) -> Page[dict[str, Any]]:
         resolved_month = get_active_month(month_year)
-        mongo_filter: dict[str, Any] = {}
+        and_conditions: list[dict[str, Any]] = []
 
         course_filter = course or batch
         if (
@@ -328,30 +377,34 @@ class StudentService:
             and course_filter.strip().upper() != "ALL"
         ):
             c_val = course_filter.strip()
-            mongo_filter["$or"] = [{"course": c_val}, {"batch": c_val}]
+            and_conditions.append({"$or": [{"course": c_val}, {"batch": c_val}]})
 
         if id_status and id_status.strip().upper() == "MISSING":
-            mongo_filter["student_id"] = {"$in": ["", None]}
+            and_conditions.append({"student_id": {"$in": ["", None]}})
         elif id_status and id_status.strip().upper() == "ASSIGNED":
-            mongo_filter["student_id"] = {"$gt": ""}
+            and_conditions.append({"student_id": {"$gt": ""}})
+
+        if active_status and active_status.strip().upper() == "ACTIVE":
+            and_conditions.append({"active": {"$ne": False}})
+        elif active_status and active_status.strip().upper() == "INACTIVE":
+            and_conditions.append({"active": False})
 
         if search and search.strip():
             rx = {"$regex": re.escape(search.strip()), "$options": "i"}
-            search_or = [
-                {"name": rx},
-                {"student_id": rx},
-                {"contact_number": rx},
-                {"course": rx},
-                {"batch": rx},
-                {"password": rx},
-            ]
-            if "$or" in mongo_filter:
-                mongo_filter = {
-                    "$and": [{"$or": mongo_filter.pop("$or")}, {"$or": search_or}],
-                    **mongo_filter,
+            and_conditions.append(
+                {
+                    "$or": [
+                        {"name": rx},
+                        {"student_id": rx},
+                        {"contact_number": rx},
+                        {"parent_name": rx},
+                        {"address": rx},
+                        {"course": rx},
+                        {"batch": rx},
+                        {"password": rx},
+                    ]
                 }
-            else:
-                mongo_filter["$or"] = search_or
+            )
 
         if fee_status and fee_status.strip().upper() in (
             "PAID",
@@ -369,28 +422,29 @@ class StudentService:
             paid_codes = [d["student_id"] for d in paid_docs if d.get("student_id")]
 
             if fee_status.strip().upper() == "PAID":
-                paid_cond = {
-                    "$or": [
-                        {"id": {"$in": paid_keys}},
-                        *(
-                            [{"student_id": {"$in": paid_codes}}]
-                            if paid_codes
-                            else []
-                        ),
-                    ]
-                }
-                mongo_filter = (
-                    {"$and": [mongo_filter, paid_cond]} if mongo_filter else paid_cond
+                and_conditions.append(
+                    {
+                        "$or": [
+                            {"id": {"$in": paid_keys}},
+                            *(
+                                [{"student_id": {"$in": paid_codes}}]
+                                if paid_codes
+                                else []
+                            ),
+                        ]
+                    }
                 )
             else:
                 unpaid_cond: dict[str, Any] = {"id": {"$nin": paid_keys}}
                 if paid_codes:
                     unpaid_cond["student_id"] = {"$nin": paid_codes}
-                mongo_filter = (
-                    {"$and": [mongo_filter, unpaid_cond]}
-                    if mongo_filter
-                    else unpaid_cond
-                )
+                and_conditions.append(unpaid_cond)
+
+        mongo_filter: dict[str, Any] = (
+            {"$and": and_conditions}
+            if len(and_conditions) > 1
+            else (and_conditions[0] if and_conditions else {})
+        )
 
         total = self._db["students"].count_documents(mongo_filter)
         rows = list(
@@ -431,6 +485,12 @@ class StudentService:
                 r["name"], code, contact
             )
             created_at = r.get("created_at")
+            is_active = (
+                bool(r["active"])
+                if "active" in r and r["active"] is not None
+                else (str(r.get("status", "ACTIVE")).upper() != "INACTIVE")
+            )
+
             fp = active_payments_by_key.get(s_uuid) or (
                 active_payments_by_code.get(code) if code else None
             )
@@ -447,11 +507,15 @@ class StudentService:
                     "has_student_id": bool(code),
                     "password": pwd,
                     "initial_passcode": pwd,
+                    "parent_name": r.get("parent_name") or "",
+                    "dob": r.get("dob") or "",
                     "contact_number": contact,
                     "phone": contact,
+                    "address": r.get("address") or "",
                     "course": course_val,
                     "batch": course_val,
                     "batch_name": course_val,
+                    "admission_date": str(r.get("admission_date") or "2027-01-01")[:10],
                     "monthly_fee": float(monthly_fee),
                     "monthly_fee_paise": int(monthly_fee * 100),
                     "fee_status": status_str,
@@ -460,15 +524,18 @@ class StudentService:
                     "current_month": resolved_month,
                     "month_label": format_month_label(resolved_month),
                     "photo_url": r.get("photo_url"),
+                    "active": is_active,
+                    "status": "ACTIVE" if is_active else "INACTIVE",
                     "created_at": (
                         created_at.isoformat()
                         if isinstance(created_at, datetime)
                         else str(created_at or "")
                     ),
-                    "active": True,
                     "active_payment_date": (
                         p_date.isoformat() if isinstance(p_date, datetime) else p_date
                     ),
+                    "active_payment_mode": fp.get("payment_mode") if fp else None,
+                    "active_received_by": fp.get("received_by") if fp else None,
                     "active_razorpay_payment_id": (
                         fp.get("razorpay_payment_id") if fp else None
                     ),
@@ -487,14 +554,21 @@ class StudentService:
             .strip()
             .upper()
         )
+        parent_name = str(payload.get("parent_name") or "").strip()
+        dob = str(payload.get("dob") or "").strip()
         contact = str(
             payload.get("contact_number") or payload.get("phone") or ""
         ).strip()
+        address = str(payload.get("address") or "").strip()
         course = (
             str(payload.get("course") or payload.get("batch") or "GENERAL")
             .strip()
             .upper()
         )
+        admission_date = str(
+            payload.get("admission_date")
+            or datetime.now(tz=UTC).strftime("%Y-%m-%d")
+        ).strip()[:10]
         raw_fee = payload.get("monthly_fee", 600)
         monthly_fee = float(Decimal(str(raw_fee)).quantize(Decimal("0.01")))
         raw_password = str(payload.get("password") or "").strip()
@@ -507,6 +581,13 @@ class StudentService:
         fee_status = str(payload.get("fee_status") or "UNPAID").strip().upper()
         if fee_status not in ("PAID", "UNPAID"):
             fee_status = "UNPAID"
+
+        is_active = (
+            bool(payload["active"])
+            if "active" in payload and payload["active"] is not None
+            else (str(payload.get("status", "ACTIVE")).upper() != "INACTIVE")
+        )
+        photo_url = payload.get("photo_data_url") or payload.get("photo_url")
 
         if student_id:
             dup = self._db["students"].find_one({"student_id": student_id})
@@ -521,13 +602,19 @@ class StudentService:
             "name": name,
             "student_id": student_id,
             "password": password,
+            "parent_name": parent_name,
+            "dob": dob,
             "contact_number": contact,
+            "address": address,
             "course": course,
             "batch": course,
+            "admission_date": admission_date,
             "monthly_fee": monthly_fee,
             "fee_status": fee_status,
             "month": active_month,
-            "photo_url": None,
+            "photo_url": photo_url,
+            "active": is_active,
+            "status": "ACTIVE" if is_active else "INACTIVE",
             "created_at": datetime.now(tz=UTC),
         }
         self._db["students"].insert_one(doc)
@@ -575,6 +662,27 @@ class StudentService:
                     f"Student ID '{new_student_id}' is already assigned to {dup['name']}."
                 )
 
+        parent_name = (
+            str(payload.get("parent_name") or "").strip()
+            if "parent_name" in payload
+            else (existing.get("parent_name") or "")
+        )
+        dob = (
+            str(payload.get("dob") or "").strip()
+            if "dob" in payload
+            else (existing.get("dob") or "")
+        )
+        address = (
+            str(payload.get("address") or "").strip()
+            if "address" in payload
+            else (existing.get("address") or "")
+        )
+        admission_date = (
+            str(payload.get("admission_date") or "2027-01-01").strip()[:10]
+            if "admission_date" in payload
+            else str(existing.get("admission_date") or "2027-01-01")[:10]
+        )
+
         if "contact_number" in payload or "phone" in payload:
             raw_contact = (
                 payload.get("contact_number")
@@ -598,8 +706,22 @@ class StudentService:
         raw_fee = payload.get("monthly_fee", existing.get("monthly_fee", 600))
         monthly_fee = float(Decimal(str(raw_fee)).quantize(Decimal("0.01")))
 
-        # Password resolution: if Admin explicitly changed password, use it;
-        # if Admin assigned a new student_id and didn't change password, auto-derive from new student_id
+        existing_active = (
+            bool(existing["active"])
+            if "active" in existing and existing["active"] is not None
+            else (str(existing.get("status", "ACTIVE")).upper() != "INACTIVE")
+        )
+        if "active" in payload and payload["active"] is not None:
+            is_active = bool(payload["active"])
+        elif "status" in payload and payload["status"] is not None:
+            is_active = str(payload["status"]).strip().upper() != "INACTIVE"
+        else:
+            is_active = existing_active
+
+        photo_url = existing.get("photo_url")
+        if payload.get("photo_data_url") or payload.get("photo_url"):
+            photo_url = payload.get("photo_data_url") or payload.get("photo_url")
+
         existing_pwd = existing.get("password") or ""
         if "password" in payload and str(payload.get("password") or "").strip():
             req_pwd = str(payload["password"]).strip()
@@ -628,11 +750,18 @@ class StudentService:
                         "name": name,
                         "student_id": new_student_id,
                         "password": password,
+                        "parent_name": parent_name,
+                        "dob": dob,
                         "contact_number": contact,
+                        "address": address,
                         "course": course,
                         "batch": course,
+                        "admission_date": admission_date,
                         "monthly_fee": monthly_fee,
                         "month": active_month,
+                        "photo_url": photo_url,
+                        "active": is_active,
+                        "status": "ACTIVE" if is_active else "INACTIVE",
                     }
                 },
                 return_document=ReturnDocument.AFTER,
@@ -642,7 +771,6 @@ class StudentService:
                 f"Student ID '{new_student_id}' is already in use."
             ) from exc
 
-        # Cascade student_id update to fee_payments if student_id changed
         if new_student_id != old_student_id:
             self._db["fee_payments"].update_many(
                 {
@@ -663,7 +791,6 @@ class StudentService:
                 },
             )
 
-        # If fee_status was included in the update payload, sync active month payment status
         if "fee_status" in payload and payload["fee_status"] is not None:
             self._set_month_payment_status(
                 student_uuid_str=student_uuid_str,
@@ -720,16 +847,36 @@ class StudentService:
                 content_type="image/jpeg",
             )
 
+        b64_jpeg = base64.b64encode(normalized_jpeg).decode("ascii")
         photo_url = f"/api/v1/students/{ref_id}/photo?v={int(time.time())}"
         updated = self._db["students"].find_one_and_update(
             {"id": str(row["id"])},
-            {"$set": {"photo_url": photo_url}},
+            {
+                "$set": {
+                    "photo_url": photo_url,
+                    "photo_b64": b64_jpeg,
+                }
+            },
             return_document=ReturnDocument.AFTER,
         )
         return self._build_student_payload(dict(updated), include_payments=True)
 
     def get_photo_bytes(self, student_identifier: str | UUID) -> tuple[bytes, str]:
         row = self._fetch_raw_student(student_identifier)
+        if row.get("photo_b64"):
+            try:
+                return base64.b64decode(row["photo_b64"]), "image/jpeg"
+            except Exception:
+                pass
+        if isinstance(row.get("photo_url"), str) and row["photo_url"].startswith(
+            "data:image/"
+        ):
+            try:
+                _, b64_part = row["photo_url"].split(",", 1)
+                return base64.b64decode(b64_part), "image/jpeg"
+            except Exception:
+                pass
+
         ref_id = row.get("student_id") or str(row["id"])
         safe_code = re.sub(r"[^A-Za-z0-9_-]", "_", ref_id)
         storage_key = f"{safe_code}.jpg"

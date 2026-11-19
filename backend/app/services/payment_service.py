@@ -1,8 +1,5 @@
-"""Server-side Razorpay Order Creation, Cryptographic Verification, and Monthly Fee Status Service (MongoDB Atlas).
-
-Supports both online Razorpay payments and Admin one-click PAID/UNPAID toggles for any student
-(by UUID `id` or `student_id`) for the active month (defaulting to December 2027, `2027-12`),
-while preserving all historical months in the backend `fee_payments` collection.
+"""Server-side Razorpay Order Creation, Cryptographic Verification, Offline Cash Collection,
+Payment Correction History, Daily Collection Report, and PDF Receipt Generator.
 """
 
 import json
@@ -14,7 +11,6 @@ from uuid import UUID, uuid4
 
 from fpdf import FPDF
 from pymongo import ReturnDocument
-from pymongo.database import Database as MongoDatabase
 
 from app.core.constants import CURRENCY, format_month_label, get_active_month
 from app.core.errors import (
@@ -46,11 +42,16 @@ def _format_payment_row(
     p_iso = p_date.isoformat() if isinstance(p_date, datetime) else p_date
     m_yr = row.get("month_year") or get_active_month()
     c_val = course or row.get("course") or row.get("batch")
+    p_mode = row.get("payment_mode") or (
+        "RAZORPAY"
+        if str(row.get("razorpay_payment_id") or "").startswith("pay_")
+        else "CASH"
+    )
     return {
         "id": str(row["id"]),
         "student_key": row.get("student_key"),
         "student_id": row.get("student_id") or "",
-        "student_name": student_name or row.get("student_name"),
+        "student_name": student_name or row.get("student_name") or "",
         "course": c_val,
         "batch": c_val,
         "amount": float(amt),
@@ -61,17 +62,24 @@ def _format_payment_row(
         "month_label": format_month_label(m_yr),
         "razorpay_order_id": row.get("razorpay_order_id"),
         "razorpay_payment_id": row.get("razorpay_payment_id"),
+        "transaction_id": row.get("razorpay_payment_id")
+        or row.get("razorpay_order_id")
+        or f"RCP-{str(row['id'])[:8].upper()}",
         "status": row.get("status", "UNPAID"),
         "payment_date": p_iso,
         "paid_at": p_iso,
-        "method": "RAZORPAY" if row.get("razorpay_payment_id") else "ADMIN",
+        "payment_mode": p_mode,
+        "method": p_mode,
+        "received_by": row.get("received_by")
+        or ("Razorpay Online" if p_mode != "CASH" else "Admin Desk"),
+        "remarks": row.get("remarks") or "",
     }
 
 
 class PaymentService:
     def __init__(
         self,
-        conn: MongoDatabase[dict[str, Any]],
+        conn: Any,
         gateway: RazorpayGateway,
     ) -> None:
         self._db = conn
@@ -109,6 +117,40 @@ class PaymentService:
             student_id_code=row.get("student_id"),
         )
         return dict(row)
+
+    def _record_correction_log(
+        self,
+        *,
+        actor: CurrentUser,
+        student_name: str,
+        student_id: str,
+        month_year: str,
+        previous_status: str,
+        new_status: str,
+        previous_amount: float,
+        new_amount: float,
+        payment_mode: str,
+        received_by: str,
+        remarks: str = "",
+    ) -> None:
+        doc = {
+            "id": str(uuid4()),
+            "student_name": student_name,
+            "student_id": student_id,
+            "month_year": month_year,
+            "month_label": format_month_label(month_year),
+            "previous_status": previous_status,
+            "new_status": new_status,
+            "previous_amount": previous_amount,
+            "new_amount": new_amount,
+            "payment_mode": payment_mode,
+            "received_by": received_by,
+            "remarks": remarks,
+            "updated_by": actor.identifier or actor.full_name or "Admin",
+            "updated_by_role": actor.role.value,
+            "created_at": datetime.now(tz=UTC).isoformat(),
+        }
+        self._db["payment_corrections"].insert_one(doc)
 
     def create_order(
         self,
@@ -164,14 +206,18 @@ class PaymentService:
             },
         )
 
+        # Do NOT mark online payments as successful until payment verification is completed
         row = self._db["fee_payments"].find_one_and_update(
             {"student_key": student_uuid_str, "month_year": target_month},
             {
                 "$set": {
                     "student_key": student_uuid_str,
                     "student_id": student.get("student_id") or "",
+                    "student_name": student["name"],
+                    "course": course,
                     "amount": float(monthly_fee),
                     "razorpay_order_id": gw_order.id,
+                    "payment_mode": "RAZORPAY",
                     "status": "PENDING",
                 },
                 "$setOnInsert": {
@@ -260,6 +306,8 @@ class PaymentService:
             {
                 "$set": {
                     "status": "PAID",
+                    "payment_mode": "RAZORPAY",
+                    "received_by": "Razorpay Online Verified",
                     "razorpay_payment_id": razorpay_payment_id,
                     "payment_date": now,
                 }
@@ -313,6 +361,8 @@ class PaymentService:
                 {
                     "$set": {
                         "status": "PAID",
+                        "payment_mode": "RAZORPAY",
+                        "received_by": "Razorpay Webhook Verified",
                         "razorpay_payment_id": rp_payment_id
                         or payment_row.get("razorpay_payment_id"),
                         "payment_date": datetime.now(tz=UTC),
@@ -349,14 +399,45 @@ class PaymentService:
         status: str = "PAID",
         amount: float | Decimal | None = None,
         reference: str | None = None,
+        payment_mode: str | None = None,
+        received_by: str | None = None,
+        remarks: str | None = None,
     ) -> dict[str, Any]:
-        """Allow SUPER_ADMIN to record or toggle a fee payment status (PAID / UNPAID) in `fee_payments`."""
+        """Allow Super Admin and Restricted Fees Admin to record or edit fee payment records
+        for any of the 12 months, logging all edits to Payment Correction History.
+        """
         target_month = _validate_month_year(month_year)
         student = self._resolve_student(actor, student_id)
         student_uuid_str = str(student["id"])
         student_code = student.get("student_id") or ""
         course = student.get("course") or student.get("batch") or "GENERAL"
         norm_status = status.strip().upper()
+        norm_mode = (payment_mode or "CASH").strip().upper()
+        collector = (
+            received_by.strip()
+            if (received_by and received_by.strip())
+            else (actor.identifier or "Admin Desk")
+        )
+        note = (remarks or "").strip()
+
+        existing = self._db["fee_payments"].find_one(
+            {
+                "$or": [
+                    {"student_key": student_uuid_str, "month_year": target_month},
+                    *(
+                        [{"student_id": student_code, "month_year": target_month}]
+                        if student_code
+                        else []
+                    ),
+                ]
+            }
+        )
+        prev_status = existing.get("status", "UNPAID") if existing else "UNPAID"
+        prev_amt = float(
+            existing.get("amount", student.get("monthly_fee", 600))
+            if existing
+            else student.get("monthly_fee", 600)
+        )
 
         if norm_status == "UNPAID":
             self._db["fee_payments"].delete_many(
@@ -371,6 +452,19 @@ class PaymentService:
                     ]
                 }
             )
+            self._record_correction_log(
+                actor=actor,
+                student_name=student["name"],
+                student_id=student_code or student_uuid_str[:8],
+                month_year=target_month,
+                previous_status=prev_status,
+                new_status="UNPAID",
+                previous_amount=prev_amt,
+                new_amount=0.0,
+                payment_mode=norm_mode,
+                received_by=collector,
+                remarks=note or "Marked as UNPAID",
+            )
             return {
                 "id": student_uuid_str,
                 "student_key": student_uuid_str,
@@ -382,6 +476,8 @@ class PaymentService:
                 "month_year": target_month,
                 "month_label": format_month_label(target_month),
                 "status": "UNPAID",
+                "payment_mode": norm_mode,
+                "received_by": collector,
                 "amount": float(student.get("monthly_fee", 600)),
             }
 
@@ -395,7 +491,11 @@ class PaymentService:
                 Decimal("0.01")
             )
         )
-        pay_ref = reference or f"ADMIN-{target_month}"
+        pay_ref = (
+            reference
+            or (existing.get("razorpay_payment_id") if existing else None)
+            or f"{norm_mode}-{target_month}-{uuid4().hex[:6].upper()}"
+        )
         now = datetime.now(tz=UTC) if norm_status == "PAID" else None
 
         row = self._db["fee_payments"].find_one_and_update(
@@ -404,8 +504,13 @@ class PaymentService:
                 "$set": {
                     "student_key": student_uuid_str,
                     "student_id": student_code,
+                    "student_name": student["name"],
+                    "course": course,
                     "amount": fee_amt,
                     "status": norm_status,
+                    "payment_mode": norm_mode,
+                    "received_by": collector,
+                    "remarks": note,
                     "razorpay_payment_id": pay_ref,
                     "payment_date": now,
                 },
@@ -418,9 +523,78 @@ class PaymentService:
             upsert=True,
             return_document=ReturnDocument.AFTER,
         )
+
+        self._record_correction_log(
+            actor=actor,
+            student_name=student["name"],
+            student_id=student_code or student_uuid_str[:8],
+            month_year=target_month,
+            previous_status=prev_status,
+            new_status=norm_status,
+            previous_amount=prev_amt,
+            new_amount=fee_amt,
+            payment_mode=norm_mode,
+            received_by=collector,
+            remarks=note or f"Recorded {norm_status} ({norm_mode})",
+        )
+
         return _format_payment_row(
             dict(row), student_name=student["name"], course=course
         )
+
+    def list_payment_corrections(self, limit: int = 100) -> list[dict[str, Any]]:
+        rows = list(
+            self._db["payment_corrections"]
+            .find({}, {"_id": 0})
+            .sort([("created_at", -1)])
+            .limit(max(1, min(limit, 500)))
+        )
+        return rows
+
+    def daily_collection_report(
+        self, date_str: str | None = None
+    ) -> dict[str, Any]:
+        target_date = (
+            date_str.strip()[:10]
+            if (date_str and date_str.strip())
+            else datetime.now(tz=UTC).strftime("%Y-%m-%d")
+        )
+        paid_rows = list(
+            self._db["fee_payments"]
+            .find({"status": "PAID"})
+            .sort([("payment_date", -1)])
+        )
+        matched_items: list[dict[str, Any]] = []
+        total_amt = Decimal("0.00")
+        cash_amt = Decimal("0.00")
+        online_amt = Decimal("0.00")
+
+        for r in paid_rows:
+            p_date = r.get("payment_date")
+            p_str = (
+                p_date.strftime("%Y-%m-%d")
+                if isinstance(p_date, datetime)
+                else str(p_date or "")[:10]
+            )
+            if p_str != target_date:
+                continue
+            formatted = _format_payment_row(dict(r))
+            amt = Decimal(str(formatted["amount"])).quantize(Decimal("0.01"))
+            total_amt += amt
+            if formatted["payment_mode"] == "CASH":
+                cash_amt += amt
+            else:
+                online_amt += amt
+            matched_items.append(formatted)
+
+        return {
+            "date": target_date,
+            "total_transactions": len(matched_items),
+            "total_collected": float(total_amt),
+            "cash_collected": float(cash_amt),
+            "online_collected": float(online_amt),
+            "items": matched_items,
+        }
 
     def get_payment(self, actor: CurrentUser, payment_id: UUID) -> dict[str, Any]:
         row = self._db["fee_payments"].find_one({"id": str(payment_id)})
@@ -433,7 +607,9 @@ class PaymentService:
         if not student and row.get("student_id"):
             student = self._db["students"].find_one({"student_id": row["student_id"]})
         if not student:
-            raise NotFoundError("student", row.get("student_id") or row.get("student_key"))
+            raise NotFoundError(
+                "student", row.get("student_id") or row.get("student_key")
+            )
 
         assert_student_self_or_staff(
             actor,
@@ -501,14 +677,16 @@ class PaymentService:
 
         items = []
         for r in rows:
-            s_doc = student_map_by_key.get(r.get("student_key", "")) or student_map_by_code.get(
-                r.get("student_id", ""), {}
-            )
+            s_doc = student_map_by_key.get(
+                r.get("student_key", "")
+            ) or student_map_by_code.get(r.get("student_id", ""), {})
             items.append(
                 _format_payment_row(
                     dict(r),
-                    student_name=s_doc.get("name"),
-                    course=s_doc.get("course") or s_doc.get("batch"),
+                    student_name=s_doc.get("name") or r.get("student_name"),
+                    course=s_doc.get("course")
+                    or s_doc.get("batch")
+                    or r.get("course"),
                 )
             )
         return Page.of(items, total, params)
@@ -526,7 +704,9 @@ class PaymentService:
         if not student and row.get("student_id"):
             student = self._db["students"].find_one({"student_id": row["student_id"]})
         if not student:
-            raise NotFoundError("student", row.get("student_id") or row.get("student_key"))
+            raise NotFoundError(
+                "student", row.get("student_id") or row.get("student_key")
+            )
 
         assert_student_self_or_staff(
             actor,
@@ -537,55 +717,91 @@ class PaymentService:
         course = student.get("course") or student.get("batch") or "GENERAL"
         code = student.get("student_id") or str(student["id"])[:8].upper()
         m_yr = row.get("month_year") or get_active_month()
+        p_mode = row.get("payment_mode") or (
+            "RAZORPAY"
+            if str(row.get("razorpay_payment_id") or "").startswith("pay_")
+            else "CASH"
+        )
+        received_by = row.get("received_by") or (
+            "Online Razorpay Gateway" if p_mode != "CASH" else "Brightway Admin Desk"
+        )
+        txn_id = (
+            row.get("razorpay_payment_id")
+            or row.get("razorpay_order_id")
+            or f"BW-{str(row['id'])[:8].upper()}"
+        )
 
         pdf = FPDF(orientation="P", unit="mm", format="A5")
         pdf.add_page()
         pdf.set_fill_color(30, 58, 138)
-        pdf.rect(0, 0, 148, 28, style="F")
+        pdf.rect(0, 0, 148, 30, style="F")
         pdf.set_fill_color(245, 158, 11)
-        pdf.rect(0, 28, 148, 2, style="F")
+        pdf.rect(0, 30, 148, 2, style="F")
 
         pdf.set_text_color(255, 255, 255)
-        pdf.set_font("Helvetica", "B", 13)
-        pdf.set_xy(10, 8)
-        pdf.cell(128, 7, "BRIGHTWAY COMPUTER ACADEMY", align="L")
-        pdf.set_font("Helvetica", "", 9)
+        pdf.set_font("Helvetica", "B", 12.5)
+        pdf.set_xy(10, 7)
+        pdf.cell(128, 6.5, "BRIGHTWAY COMPUTER EDUCATION", align="L")
+        pdf.set_font("Helvetica", "B", 8)
         pdf.set_text_color(251, 191, 36)
-        pdf.set_xy(10, 16)
-        pdf.cell(128, 6, "OFFICIAL FEE PAYMENT RECEIPT", align="L")
+        pdf.set_xy(10, 14)
+        pdf.cell(
+            128,
+            5,
+            "AFFILIATED TO RGYCSM (rgycsm.org)  |  OFFICIAL FEE RECEIPT",
+            align="L",
+        )
+        pdf.set_font("Helvetica", "", 7)
+        pdf.set_text_color(226, 232, 240)
+        pdf.set_xy(10, 20)
+        pdf.cell(
+            128,
+            5,
+            "Verified Campus Location: https://share.google/ckM9UxaHIv8pXOjjd",
+            align="L",
+        )
 
         pdf.set_text_color(15, 23, 42)
         y = 38
         p_date = row.get("payment_date")
         details = [
-            ("Receipt ID", f"BW-RCP-{str(row['id'])[:8].upper()}"),
+            ("Receipt Number", f"BW-RCP-{str(row['id'])[:8].upper()}"),
             ("Student Name", str(student["name"])),
             ("Student ID", code),
-            ("Course", str(course)),
+            ("Course Name", str(course)),
             ("Contact Number", str(student.get("contact_number") or "-")),
-            ("Fee Month", f"{format_month_label(m_yr)} ({m_yr})"),
-            ("Amount Paid", f"INR {Decimal(str(row['amount'])):.2f}"),
+            ("Payment Month", f"{format_month_label(m_yr)} ({m_yr})"),
+            ("Payment Amount", f"INR {Decimal(str(row['amount'])):.2f}"),
+            ("Payment Method", str(p_mode)),
+            ("Transaction ID", str(txn_id)),
+            ("Received By", str(received_by)),
             ("Payment Status", str(row["status"])),
-            (
-                "Payment Reference",
-                str(row.get("razorpay_payment_id") or "ADMIN-RECORDED"),
-            ),
             (
                 "Payment Date",
                 p_date.strftime("%d %b %Y, %I:%M %p")
                 if isinstance(p_date, datetime)
-                else str(p_date or "-"),
+                else str(p_date or datetime.now(tz=UTC).strftime("%d %b %Y")),
             ),
         ]
         for label, value in details:
             pdf.set_xy(12, y)
-            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_font("Helvetica", "B", 8.5)
             pdf.set_text_color(100, 116, 139)
-            pdf.cell(48, 7, label)
-            pdf.set_font("Helvetica", "B", 9.5)
+            pdf.cell(46, 6.5, label)
+            pdf.set_font("Helvetica", "B", 9)
             pdf.set_text_color(15, 23, 42)
-            pdf.cell(76, 7, value.encode("latin-1", "replace").decode("latin-1"))
-            y += 8.5
+            pdf.cell(78, 6.5, value.encode("latin-1", "replace").decode("latin-1"))
+            y += 7.8
+
+        pdf.set_xy(12, y + 4)
+        pdf.set_font("Helvetica", "I", 7.5)
+        pdf.set_text_color(100, 116, 139)
+        pdf.cell(
+            124,
+            6,
+            "Computer generated receipt verified by Brightway Computer Education.",
+            align="C",
+        )
 
         filename = f"Brightway-Receipt-{code}-{m_yr}.pdf"
         return bytes(pdf.output()), filename

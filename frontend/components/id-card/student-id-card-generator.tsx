@@ -3,12 +3,11 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Camera,
-  Download,
   FileText,
   Image as ImageIcon,
   Loader2,
   CheckCircle2,
-  Upload,
+  ShieldCheck,
 } from "lucide-react";
 import { useToast } from "@/components/ui/toast";
 
@@ -18,7 +17,11 @@ interface StudentIdCardGeneratorProps {
   batch: string;
   contactNumber: string;
   monthlyFee: number;
+  admissionDate?: string;
+  validitySession?: string;
+  instituteAddress?: string;
   photoUrl?: string | null;
+  allowPhotoUpload?: boolean;
   onPhotoUploaded?: (newPhotoUrl: string) => void;
 }
 
@@ -29,8 +32,11 @@ export function StudentIdCardGenerator({
   name,
   batch,
   contactNumber,
-  monthlyFee,
+  admissionDate = "2026-01-10",
+  validitySession = "2027 – 2028",
+  instituteAddress = "Alambazar, Baranagar, Kolkata - 700035",
   photoUrl,
+  allowPhotoUpload = false,
   onPhotoUploaded,
 }: StudentIdCardGeneratorProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -100,19 +106,23 @@ export function StudentIdCardGenerator({
       ctx.textAlign = "center";
       ctx.fillText("BW", 78, 86);
 
-      // 5. Academy Title & Subtitle
+      // 5. Academy Title, Affiliation & Institute Address
       ctx.textAlign = "left";
       ctx.fillStyle = "#FFFFFF";
-      ctx.font = "900 35px Inter, system-ui, sans-serif";
-      ctx.fillText("BRIGHTWAY COMPUTER EDUCATION", 142, 68);
+      ctx.font = "900 34px Inter, system-ui, sans-serif";
+      ctx.fillText("BRIGHTWAY COMPUTER EDUCATION", 142, 58);
 
       ctx.fillStyle = "#FBBF24";
-      ctx.font = "700 17px Inter, system-ui, sans-serif";
+      ctx.font = "700 16px Inter, system-ui, sans-serif";
       ctx.fillText(
         "AFFILIATED TO RGYCSM (rgycsm.org)  •  OFFICIAL STUDENT ID CARD",
         142,
-        104
+        90
       );
+
+      ctx.fillStyle = "#DBEAFE";
+      ctx.font = "600 15px Inter, system-ui, sans-serif";
+      ctx.fillText(`Institute Address: ${instituteAddress}`, 142, 120);
 
       // 6. Student Photograph Frame (Left)
       const px = 56;
@@ -128,7 +138,6 @@ export function StudentIdCardGenerator({
         ctx.beginPath();
         ctx.rect(px, py, pw, ph);
         ctx.clip();
-        // Cover-fit image inside frame
         const imgRatio = loadedPhoto.width / loadedPhoto.height;
         const boxRatio = pw / ph;
         let drawW = pw;
@@ -145,7 +154,6 @@ export function StudentIdCardGenerator({
         ctx.drawImage(loadedPhoto, offsetX, offsetY, drawW, drawH);
         ctx.restore();
       } else {
-        // Fallback Monogram Avatar
         ctx.fillStyle = "#1E3A8A";
         ctx.fillRect(px, py, pw, ph);
         const initials =
@@ -178,7 +186,6 @@ export function StudentIdCardGenerator({
       const infoX = 348;
       ctx.textAlign = "left";
 
-      // Student Full Name
       ctx.fillStyle = "#64748B";
       ctx.font = "700 15px Inter, system-ui, sans-serif";
       ctx.fillText("STUDENT FULL NAME", infoX, 220);
@@ -191,29 +198,29 @@ export function StudentIdCardGenerator({
       ctx.fillStyle = "#E2E8F0";
       ctx.fillRect(infoX, 276, 608, 2);
 
-      // Grid of Metadata Fields
+      // Grid of Metadata Fields (Student ID, Course Name, Admission Date, Contact Number)
       const fields = [
         { label: "STUDENT ID", value: studentId, x: infoX, y: 315, highlight: true },
+        {
+          label: "ADMISSION DATE",
+          value: admissionDate || "2026-01-10",
+          x: infoX + 310,
+          y: 315,
+          highlight: false,
+        },
+        {
+          label: "COURSE NAME",
+          value: (batch || "GENERAL").slice(0, 28),
+          x: infoX,
+          y: 405,
+          highlight: false,
+        },
         {
           label: "CONTACT NUMBER",
           value:
             contactNumber && contactNumber !== "0000000000"
               ? `+91 ${contactNumber}`
               : "Registered on Portal",
-          x: infoX + 310,
-          y: 315,
-          highlight: false,
-        },
-        {
-          label: "COURSE / BATCH",
-          value: (batch || "GENERAL-2026").slice(0, 32),
-          x: infoX,
-          y: 405,
-          highlight: false,
-        },
-        {
-          label: "MONTHLY FEE",
-          value: `INR ${Number(monthlyFee || 600).toFixed(0)} / Month`,
           x: infoX + 310,
           y: 405,
           highlight: false,
@@ -238,7 +245,11 @@ export function StudentIdCardGenerator({
       ctx.strokeRect(infoX, 472, 390, 44);
       ctx.fillStyle = "#1E3A8A";
       ctx.font = "700 16px Inter, system-ui, sans-serif";
-      ctx.fillText("VALID SESSION: 2026 – 2027  •  ACTIVE", infoX + 18, 500);
+      ctx.fillText(
+        `VALIDITY / SESSION: ${validitySession}  •  VERIFIED`,
+        infoX + 18,
+        500
+      );
 
       // Authorized Signatory Block
       ctx.fillStyle = "#0F172A";
@@ -253,18 +264,18 @@ export function StudentIdCardGenerator({
       ctx.fillRect(0, 574, width, 64);
 
       ctx.fillStyle = "#FFFFFF";
-      ctx.font = "700 16px Inter, system-ui, sans-serif";
+      ctx.font = "700 15px Inter, system-ui, sans-serif";
       ctx.textAlign = "left";
       ctx.fillText(
-        "BRIGHTWAY COMPUTER EDUCATION  •  Affiliated to RGYCSM",
+        `BRIGHTWAY COMPUTER EDUCATION  •  ${instituteAddress}`,
         48,
         612
       );
 
       ctx.fillStyle = "#FBBF24";
       ctx.textAlign = "right";
-      ctx.font = "800 16px Inter, system-ui, sans-serif";
-      ctx.fillText(`PORTAL ID: ${studentId}`, width - 48, 612);
+      ctx.font = "800 15px Inter, system-ui, sans-serif";
+      ctx.fillText(`STUDENT ID: ${studentId}`, width - 48, 612);
     };
 
     const img = new Image();
@@ -272,7 +283,16 @@ export function StudentIdCardGenerator({
     img.onload = () => drawCard(img);
     img.onerror = () => drawCard(null);
     img.src = activePhotoSrc;
-  }, [name, studentId, batch, contactNumber, monthlyFee, activePhotoSrc]);
+  }, [
+    name,
+    studentId,
+    batch,
+    contactNumber,
+    admissionDate,
+    validitySession,
+    instituteAddress,
+    activePhotoSrc,
+  ]);
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -301,10 +321,13 @@ export function StudentIdCardGenerator({
       const formData = new FormData();
       formData.append("file", file);
 
-      const res = await fetch("/api/backend/v1/students/me/photo", {
-        method: "POST",
-        body: formData,
-      });
+      const res = await fetch(
+        `/api/backend/v1/students/${encodeURIComponent(studentId)}/photo`,
+        {
+          method: "POST",
+          body: formData,
+        }
+      );
       const json = await res.json();
       if (!res.ok || !json.success) {
         throw new Error(json?.error?.message || "Failed to upload photograph.");
@@ -320,8 +343,7 @@ export function StudentIdCardGenerator({
       toast({
         type: "success",
         title: "Photograph Updated",
-        description:
-          "Your profile photo has been bound to your student profile and ID card.",
+        description: "Student photograph updated on official ID card.",
       });
     } catch (err) {
       toast({
@@ -396,38 +418,42 @@ export function StudentIdCardGenerator({
         <div>
           <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-100 text-amber-800 px-3 py-0.5 text-xs font-extrabold uppercase tracking-wider">
             <CheckCircle2 className="h-3.5 w-3.5 text-[#F59E0B]" />
-            Automated Digital ID Card Generator
+            Official Digital Student ID Card
           </span>
           <h2 className="mt-1.5 font-display text-xl font-extrabold text-[#1E3A8A]">
-            Official Student Identity Card &amp; Photo Studio
+            Brightway Computer Education — Student Identity Card
           </h2>
           <p className="text-xs text-slate-500">
-            Upload your portrait photo (PNG/JPEG, max 2 MB) to instantly render and download your ID card.
+            Includes Brightway Logo, Institute Address, Photograph, Student Name, Student ID, Course Name, Admission Date, and Session Validity.
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2.5">
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/png,image/jpeg"
-            onChange={handleFileChange}
-            className="hidden"
-          />
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={isUploading}
-            className="inline-flex items-center gap-2 rounded-xl border border-[#2563EB] bg-blue-50/70 hover:bg-blue-100/80 text-[#1E3A8A] px-4 py-2.5 text-xs font-extrabold transition-colors cursor-pointer"
-          >
-            {isUploading ? (
-              <Loader2 className="h-4 w-4 animate-spin text-[#2563EB]" />
-            ) : (
-              <Camera className="h-4 w-4 text-[#2563EB]" />
-            )}
-            <span>{isUploading ? "Uploading Photo..." : "Upload Photo (Max 2MB)"}</span>
-          </button>
-        </div>
+        {allowPhotoUpload && (
+          <div className="flex flex-wrap items-center gap-2.5">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/png,image/jpeg"
+              onChange={handleFileChange}
+              className="hidden"
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isUploading}
+              className="inline-flex items-center gap-2 rounded-xl border border-[#2563EB] bg-blue-50/70 hover:bg-blue-100/80 text-[#1E3A8A] px-4 py-2.5 text-xs font-extrabold transition-colors cursor-pointer"
+            >
+              {isUploading ? (
+                <Loader2 className="h-4 w-4 animate-spin text-[#2563EB]" />
+              ) : (
+                <Camera className="h-4 w-4 text-[#2563EB]" />
+              )}
+              <span>
+                {isUploading ? "Uploading Photo..." : "Update Student Photo"}
+              </span>
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Live High-DPI HTML5 Canvas Preview */}
@@ -440,15 +466,15 @@ export function StudentIdCardGenerator({
           />
         </div>
         <p className="mt-3 text-[11px] text-slate-300 font-medium">
-          Live CR80 High-Resolution Canvas Preview • Updates automatically on photo upload
+          Official CR80 Digital ID Card • Managed by Super Admin
         </p>
       </div>
 
       {/* One-Click Download Controls (PNG & PDF) */}
       <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 pt-2">
         <div className="flex items-center gap-2 text-xs text-slate-600">
-          <Upload className="h-4 w-4 text-[#F59E0B] shrink-0" />
-          <span>Accepted formats: PNG, JPEG up to 2 MB.</span>
+          <ShieldCheck className="h-4 w-4 text-emerald-600 shrink-0" />
+          <span>Verified Official ID Record • Available as PDF &amp; PNG</span>
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
@@ -481,4 +507,3 @@ export function StudentIdCardGenerator({
     </div>
   );
 }
-

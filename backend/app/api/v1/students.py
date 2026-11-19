@@ -8,6 +8,7 @@ from app.dependencies import (
     AdminDep,
     ContainerDep,
     CurrentUserDep,
+    SuperAdminDep,
     id_card_service,
     student_service,
 )
@@ -23,13 +24,21 @@ class StudentWritePayload(BaseModel):
     name: str | None = Field(default=None, max_length=200)
     full_name: str | None = Field(default=None, max_length=200)
     password: str | None = Field(default=None, max_length=128)
+    parent_name: str | None = Field(default=None, max_length=200)
+    dob: str | None = Field(default=None, max_length=32)
     contact_number: str | None = Field(default=None, max_length=32)
     phone: str | None = Field(default=None, max_length=32)
+    address: str | None = Field(default=None, max_length=500)
     course: str | None = Field(default=None, max_length=120)
     batch: str | None = Field(default=None, max_length=120)
+    admission_date: str | None = Field(default=None, max_length=32)
     monthly_fee: float | None = Field(default=None, ge=0)
     fee_status: str | None = Field(default=None, max_length=32)
     month: str | None = Field(default=None, max_length=32)
+    active: bool | None = Field(default=None)
+    status: str | None = Field(default=None, max_length=32)
+    photo_url: str | None = Field(default=None)
+    photo_data_url: str | None = Field(default=None)
 
 
 @router.get("", response_model=ApiResponse[Page[dict[str, Any]]])
@@ -42,6 +51,7 @@ def list_students(
     course: str | None = None,
     fee_status: str | None = None,
     id_status: str | None = None,
+    active_status: str | None = None,
     month_year: str | None = None,
     month: str | None = None,
 ) -> ApiResponse[Page[dict[str, Any]]]:
@@ -54,6 +64,7 @@ def list_students(
             course=course,
             fee_status=fee_status,
             id_status=id_status,
+            active_status=active_status,
             month_year=resolved_month,
         )
     )
@@ -63,22 +74,24 @@ def list_students(
     "", response_model=ApiResponse[dict[str, Any]], status_code=status.HTTP_201_CREATED
 )
 def create_student(
-    payload: StudentWritePayload, _user: AdminDep, container: ContainerDep
+    payload: StudentWritePayload, _user: SuperAdminDep, container: ContainerDep
 ) -> ApiResponse[dict[str, Any]]:
     return ok(student_service(container).create(payload.model_dump(exclude_none=True)))
 
 
 @router.get("/me", response_model=ApiResponse[dict[str, Any]])
 def get_my_student_profile(
-    user: CurrentUserDep, container: ContainerDep
+    user: CurrentUserDep,
+    container: ContainerDep,
+    year: int | None = None,
 ) -> ApiResponse[dict[str, Any]]:
-    return ok(student_service(container).get_me(user))
+    return ok(student_service(container).get_me(user, year=year))
 
 
 @router.post("/me/photo", response_model=ApiResponse[dict[str, Any]])
 @router.put("/me/photo", response_model=ApiResponse[dict[str, Any]])
 async def upload_my_photo(
-    user: CurrentUserDep,
+    user: SuperAdminDep,
     container: ContainerDep,
     file: UploadFile = File(...),
 ) -> ApiResponse[dict[str, Any]]:
@@ -133,7 +146,7 @@ def get_student(
 def update_student(
     student_id: str,
     payload: StudentWritePayload,
-    _user: AdminDep,
+    _user: SuperAdminDep,
     container: ContainerDep,
 ) -> ApiResponse[dict[str, Any]]:
     return ok(
@@ -145,7 +158,7 @@ def update_student(
 
 @router.delete("/{student_id}", response_model=ApiResponse[dict[str, Any]])
 def delete_student(
-    student_id: str, _user: AdminDep, container: ContainerDep
+    student_id: str, _user: SuperAdminDep, container: ContainerDep
 ) -> ApiResponse[dict[str, Any]]:
     return ok(student_service(container).delete(student_id))
 
@@ -154,7 +167,7 @@ def delete_student(
 @router.post("/{student_id}/photo", response_model=ApiResponse[dict[str, Any]])
 async def upload_student_photo(
     student_id: str,
-    user: CurrentUserDep,
+    user: SuperAdminDep,
     container: ContainerDep,
     file: UploadFile = File(...),
 ) -> ApiResponse[dict[str, Any]]:

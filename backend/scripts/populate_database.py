@@ -23,7 +23,17 @@ from app.db.client import ensure_indexes, get_active_database
 from app.services.csv_import_service import CsvImportService
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-ALLOWED_COLLECTIONS = {"students", "admins", "fee_payments"}
+ALLOWED_COLLECTIONS = {
+    "students",
+    "admins",
+    "fee_payments",
+    "expenses",
+    "admissions",
+    "photo_albums",
+    "system_settings",
+    "activity_logs",
+    "payment_corrections",
+}
 
 
 def seed_database(db: Any) -> None:
@@ -44,8 +54,10 @@ def seed_database(db: Any) -> None:
         {
             "$set": {
                 "username": "BWADMIN",
+                "display_name": "Brightway Super Admin",
                 "password_hash": admin_hash,
                 "role": "SUPER_ADMIN",
+                "active": True,
             },
             "$setOnInsert": {
                 "id": str(uuid4()),
@@ -54,7 +66,25 @@ def seed_database(db: Any) -> None:
         },
         upsert=True,
     )
-    print("Upserted SUPER_ADMIN user 'BWADMIN' into `admins` collection.")
+    fees_admin_hash = hash_password("Brightway@Fees2026!")
+    db["admins"].update_one(
+        {"username": "FEESADMIN"},
+        {
+            "$set": {
+                "username": "FEESADMIN",
+                "display_name": "Brightway Fees Admin (Restricted)",
+                "password_hash": fees_admin_hash,
+                "role": "ADMIN",
+                "active": True,
+            },
+            "$setOnInsert": {
+                "id": str(uuid4()),
+                "created_at": datetime.now(tz=UTC),
+            },
+        },
+        upsert=True,
+    )
+    print("Upserted SUPER_ADMIN 'BWADMIN' and Restricted ADMIN 'FEESADMIN' into `admins` collection.")
 
     importer = CsvImportService(db)
     csv_files = [

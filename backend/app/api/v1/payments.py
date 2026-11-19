@@ -43,6 +43,9 @@ class AdminRecordPaymentPayload(BaseModel):
     status: str = Field(default="PAID", pattern=r"^(PAID|PENDING|FAILED|UNPAID)$")
     amount: float | None = Field(default=None, ge=0)
     reference: str | None = Field(default=None, max_length=120)
+    payment_mode: str | None = Field(default="CASH", max_length=32)
+    received_by: str | None = Field(default=None, max_length=120)
+    remarks: str | None = Field(default=None, max_length=250)
 
 
 @router.get("", response_model=ApiResponse[Page[dict[str, Any]]])
@@ -132,6 +135,9 @@ def admin_record_payment(
             status=payload.status,
             amount=payload.amount,
             reference=payload.reference,
+            payment_mode=payload.payment_mode,
+            received_by=payload.received_by,
+            remarks=payload.remarks,
         )
     )
 

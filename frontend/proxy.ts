@@ -14,12 +14,17 @@ interface JwtPayload {
 
 const VALID_ROLES = new Set(["SUPER_ADMIN", "ADMIN", "STUDENT"]);
 
-function decodeBrightwayJwt(token: string): { payload: JwtPayload; role: string } | null {
+function decodeBrightwayJwt(
+  token: string
+): { payload: JwtPayload; role: string } | null {
   try {
     const parts = token.split(".");
     if (parts.length !== 3) return null;
     const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "=");
+    const padded = base64.padEnd(
+      base64.length + ((4 - (base64.length % 4)) % 4),
+      "="
+    );
     const json = atob(padded);
     const payload = JSON.parse(json) as JwtPayload;
     if (payload.exp && payload.exp * 1000 < Date.now()) {
@@ -55,9 +60,10 @@ export function proxy(request: NextRequest) {
 
   const decoded = token ? decodeBrightwayJwt(token) : null;
   const role = decoded?.role ?? null;
-  const isAdminRole = role === "SUPER_ADMIN" || role === "ADMIN";
+  const isSuperAdmin = role === "SUPER_ADMIN";
+  const isRestrictedAdmin = role === "ADMIN";
+  const isAnyAdmin = isSuperAdmin || isRestrictedAdmin;
 
-  // If visiting /login and a stale/invalid cookie exists, wipe it and render /login cleanly
   if (isAuthPage) {
     if (token && !decoded) {
       return clearStaleCookies(NextResponse.next());
@@ -65,20 +71,28 @@ export function proxy(request: NextRequest) {
     return NextResponse.next();
   }
 
-  // Redirect unauthenticated or stale-cookie users away from protected routes
   if ((isAdminRoute || isStudentRoute) && !decoded) {
     const loginUrl = new URL("/login", request.url);
     loginUrl.searchParams.set("redirect", pathname);
     return clearStaleCookies(NextResponse.redirect(loginUrl));
   }
 
-  // Enforce strict RBAC on /admin and /student routes
-  if (isAdminRoute && !isAdminRole) {
+  // Enforce strict Three-Level RBAC on /admin and /student routes
+  if (isAdminRoute && !isAnyAdmin) {
     return NextResponse.redirect(new URL("/student", request.url));
   }
 
+  // Restricted ADMIN can ONLY access /admin/fees (Monthly Fee Management)
+  if (isAdminRoute && isRestrictedAdmin) {
+    if (!pathname.startsWith("/admin/fees")) {
+      return NextResponse.redirect(new URL("/admin/fees", request.url));
+    }
+  }
+
   if (isStudentRoute && role !== "STUDENT") {
-    return NextResponse.redirect(new URL("/admin", request.url));
+    return NextResponse.redirect(
+      new URL(isRestrictedAdmin ? "/admin/fees" : "/admin", request.url)
+    );
   }
 
   return NextResponse.next();

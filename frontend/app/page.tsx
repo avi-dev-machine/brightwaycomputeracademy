@@ -148,11 +148,20 @@ export default function HomePage() {
                 <div className="flex flex-wrap items-center gap-3.5 pt-2">
                   <Link
                     href="/login"
-                    className="inline-flex items-center gap-2.5 rounded-xl bg-[#F59E0B] hover:bg-[#FBBF24] text-slate-950 font-extrabold px-7 py-4 text-sm sm:text-base shadow-xl shadow-amber-500/25 transition-all transform hover:-translate-y-0.5"
+                    className="inline-flex items-center gap-2.5 rounded-xl bg-[#F59E0B] hover:bg-[#FBBF24] text-slate-950 font-extrabold px-6 py-4 text-sm sm:text-base shadow-xl shadow-amber-500/25 transition-all transform hover:-translate-y-0.5"
                   >
                     <GraduationCap className="h-5 w-5" />
                     <span>Student Portal Login</span>
                     <ArrowRight className="h-4 w-4" />
+                  </Link>
+
+                  <Link
+                    href="/admissions"
+                    className="inline-flex items-center gap-2.5 rounded-xl bg-white hover:bg-blue-50 text-[#1E3A8A] font-extrabold px-6 py-4 text-sm sm:text-base shadow-lg transition-all transform hover:-translate-y-0.5"
+                  >
+                    <FileCheck2 className="h-5 w-5 text-[#F59E0B]" />
+                    <span>Online Admission Form</span>
+                    <ArrowRight className="h-4 w-4 text-[#2563EB]" />
                   </Link>
 
                   <a
@@ -407,16 +416,14 @@ export default function HomePage() {
                     </div>
                   </div>
 
-                  <div className="mt-6 pt-4 border-t border-slate-100 flex items-center justify-between">
-                    <a
-                      href={RGYCSM_COURSES_URL}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1 text-xs font-bold text-slate-600 hover:text-[#1E3A8A]"
+                  <div className="mt-6 pt-4 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2">
+                    <Link
+                      href={`/admissions?course=${encodeURIComponent(item.code)}`}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-[#F59E0B] hover:bg-[#FBBF24] text-slate-950 px-3 py-1.5 text-xs font-extrabold transition-colors"
                     >
-                      <span>Verify on rgycsm.org</span>
-                      <ExternalLink className="h-3 w-3" />
-                    </a>
+                      <span>Online Admission Form</span>
+                      <ArrowRight className="h-3.5 w-3.5" />
+                    </Link>
                     <Link
                       href="/login"
                       className="inline-flex items-center gap-1.5 text-xs font-extrabold text-[#2563EB] hover:text-[#1E3A8A]"

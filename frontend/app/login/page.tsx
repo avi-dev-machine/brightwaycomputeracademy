@@ -64,6 +64,11 @@ function LoginForm() {
       const redirectParam = searchParams.get("redirect");
       const isAdmin = user.role === "SUPER_ADMIN" || user.role === "ADMIN";
 
+      if (user.role === "ADMIN") {
+        router.push("/admin/fees");
+        return;
+      }
+
       if (redirectParam && redirectParam.startsWith("/")) {
         if (redirectParam.startsWith("/admin") && isAdmin) {
           router.push(redirectParam);
@@ -246,10 +251,15 @@ function LoginForm() {
           </ul>
         </div>
       ) : (
-        <div className="rounded-xl border border-amber-200 bg-amber-50/70 p-4 text-xs text-slate-700">
-          <p className="font-bold text-slate-900">Authorized Super Admin Access</p>
-          <p className="text-slate-600 mt-1">
-            Protected by bcrypt password hashing and server-side JWT verification.
+        <div className="rounded-xl border border-amber-200 bg-amber-50/70 p-4 text-xs text-slate-700 space-y-1.5">
+          <p className="font-bold text-slate-900">
+            Three-Level Access Control (Super Admin &amp; Restricted Admin)
+          </p>
+          <p className="text-slate-600">
+            <strong>Super Admin</strong> (<code className="font-mono font-bold text-[#1E3A8A]">BWADMIN</code>): Full institute management, Cash Flow, Admissions, Albums &amp; Settings.
+          </p>
+          <p className="text-slate-600">
+            <strong>Fees Admin</strong> (<code className="font-mono font-bold text-[#1E3A8A]">FEESADMIN</code>): Restricted access to Monthly Fee Management only.
           </p>
         </div>
       )}
