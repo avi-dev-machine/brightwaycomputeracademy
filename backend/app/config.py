@@ -19,11 +19,11 @@ class Settings(BaseSettings):
 
     app_name: str = "BRIGHTWAY COMPUTER EDUCATION Portal"
     app_env: Literal["development", "test", "staging", "production"] = "development"
-    app_base_url: str = "http://localhost:8000"
-    public_app_url: str = "http://localhost:3000"
+    app_base_url: str = "https://brightwaycomputeracademy.onrender.com"
+    public_app_url: str = "https://brightwaycomputeracademy.vercel.app"
     app_version: str = "2.0.0"
     log_level: str = "INFO"
-    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+    cors_origins: str = "https://brightwaycomputeracademy.vercel.app,http://localhost:3000,http://127.0.0.1:3000"
     expose_api_docs: bool | None = None
     timezone: str = "Asia/Kolkata"
 
