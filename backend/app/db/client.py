@@ -124,7 +124,11 @@ def init_pool(settings: Settings | None = None) -> Any:
     db = get_active_database(settings)
     # Auto-seed if empty and ensure both SUPER_ADMIN (BWADMIN) and restricted ADMIN (FEESADMIN) exist
     try:
-        if db["students"].count_documents({}) == 0 or db["admins"].count_documents({}) == 0:
+        if (
+            db["students"].count_documents({}) == 0
+            or db["admins"].count_documents({}) == 0
+            or db["fee_payments"].count_documents({}) == 0
+        ):
             from scripts.populate_database import seed_database
 
             seed_database(db)

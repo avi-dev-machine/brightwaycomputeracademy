@@ -314,49 +314,8 @@ export default function SuperAdminSettingsPage() {
           )}
         </div>
 
-        {/* Cash Flow Secondary Password + Admin Account Creator */}
+        {/* Admin Account Creator */}
         <div className="space-y-6">
-          <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs space-y-4">
-            <div className="flex items-center gap-2.5 border-b border-slate-100 pb-3">
-              <Lock className="h-5 w-5 text-[#F59E0B]" />
-              <div>
-                <h2 className="font-display text-base font-extrabold text-[#1E3A8A]">
-                  Cash Flow Secondary Password Protection
-                </h2>
-                <p className="text-xs text-slate-500">
-                  Additional password required before opening Super Admin Cash Flow Management
-                </p>
-              </div>
-            </div>
-
-            <form
-              onSubmit={handleUpdateCashflowPassword}
-              className="flex flex-col sm:flex-row gap-3"
-            >
-              <input
-                type="password"
-                required
-                minLength={6}
-                value={cashflowPassword}
-                onChange={(e) => setCashflowPassword(e.target.value)}
-                placeholder="Enter new Cash Flow password (default: Brightway@Cash2026!)"
-                className="flex-1 rounded-xl border border-slate-300 px-3.5 py-2.5 text-xs focus:border-[#2563EB] focus:outline-none"
-              />
-              <button
-                type="submit"
-                disabled={isUpdatingCashPwd}
-                className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#1E3A8A] hover:bg-[#2563EB] text-white px-4 py-2.5 text-xs font-extrabold cursor-pointer"
-              >
-                {isUpdatingCashPwd ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <CheckCircle2 className="h-4 w-4 text-[#FBBF24]" />
-                )}
-                <span>Update Password</span>
-              </button>
-            </form>
-          </div>
-
           <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-xs space-y-4">
             <div className="flex items-center gap-2.5 border-b border-slate-100 pb-3">
               <UserPlus className="h-5 w-5 text-[#2563EB]" />

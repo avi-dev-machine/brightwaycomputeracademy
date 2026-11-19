@@ -101,7 +101,8 @@ def seed_database(db: Any) -> None:
                 )
                 print(
                     f"Ingested {csv_path.name}: total={summary['total_rows']}, "
-                    f"inserted={summary['inserted_rows']}, updated={summary['updated_rows']}"
+                    f"inserted={summary['inserted_rows']}, updated={summary['updated_rows']}, "
+                    f"fee_records={summary['fee_records_upserted']}"
                 )
 
     if not found_csv:
@@ -119,6 +120,14 @@ def seed_database(db: Any) -> None:
                 ]
                 db["students"].bulk_write(ops, ordered=False)
                 print(f"Seeded {len(students_list)} students from bundled seed_data.json.")
+            payments_list = raw.get("fee_payments", [])
+            if payments_list:
+                f_ops = [
+                    UpdateOne({"id": fp["id"]}, {"$set": fp}, upsert=True)
+                    for fp in payments_list
+                ]
+                db["fee_payments"].bulk_write(f_ops, ordered=False)
+                print(f"Seeded {len(payments_list)} monthly fee records from bundled seed_data.json.")
 
     active_month = get_active_month()
     students_count = db["students"].count_documents({})

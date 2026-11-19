@@ -242,49 +242,25 @@ class ManagementService:
         return {"deleted": True, "id": admin_id, "username": target["username"]}
 
     # -------------------------------------------------------------------------
-    # Cash Flow Management — SUPER_ADMIN ONLY + Additional Password Protection
+    # Cash Flow Management — SUPER_ADMIN ONLY (3-Tier RBAC, No Secondary Lock)
     # -------------------------------------------------------------------------
     def verify_cashflow_access(
-        self, actor: CurrentUser, supplied_password: str | None
+        self, actor: CurrentUser, supplied_password: str | None = None
     ) -> dict[str, bool]:
-        """Strictly require Role.SUPER_ADMIN AND valid additional Cash Flow password."""
+        """Strictly require Role.SUPER_ADMIN (3-tier RBAC without secondary lock)."""
         assert_super_admin(actor)
-        pwd = (supplied_password or "").strip()
-        if not pwd:
-            raise AuthorizationError(
-                "Additional Cash Flow security password is required to access Cash Flow Management."
-            )
-
-        settings_doc = self._db["system_settings"].find_one({"key": "global"})
-        cf_hash = (
-            settings_doc.get("cashflow_password_hash") if settings_doc else None
-        )
-
-        # Allow the dedicated Cash Flow password (default `Brightway@Cash2026!`) OR the Super Admin's login password
-        matched = False
-        if cf_hash and verify_password(pwd, cf_hash):
-            matched = True
-        elif pwd == DEFAULT_CASHFLOW_PASSWORD:
-            matched = True
-        else:
-            admin_doc = self._db["admins"].find_one({"id": str(actor.id)})
-            if admin_doc and verify_password(pwd, admin_doc.get("password_hash", "")):
-                matched = True
-
-        if not matched:
-            raise AuthorizationError("Invalid Cash Flow security password.")
         return {"unlocked": True}
 
     def get_cashflow_dashboard(
         self,
         actor: CurrentUser,
-        cashflow_password: str | None,
+        cashflow_password: str | None = None,
         *,
-        year: int = 2027,
+        year: int = 2026,
         month_year: str | None = None,
         date_str: str | None = None,
     ) -> dict[str, Any]:
-        self.verify_cashflow_access(actor, cashflow_password)
+        assert_super_admin(actor)
         target_month = get_active_month(month_year)
         target_date = (
             date_str.strip()
@@ -438,10 +414,11 @@ class ManagementService:
     def add_expense(
         self,
         actor: CurrentUser,
-        cashflow_password: str | None,
-        payload: dict[str, Any],
+        cashflow_password: str | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        self.verify_cashflow_access(actor, cashflow_password)
+        assert_super_admin(actor)
+        payload = payload or {}
         description = str(
             payload.get("description") or payload.get("title") or ""
         ).strip()
@@ -478,10 +455,10 @@ class ManagementService:
     def delete_expense(
         self,
         actor: CurrentUser,
-        cashflow_password: str | None,
-        expense_id: str,
+        cashflow_password: str | None = None,
+        expense_id: str = "",
     ) -> dict[str, Any]:
-        self.verify_cashflow_access(actor, cashflow_password)
+        assert_super_admin(actor)
         existing = self._db["expenses"].find_one({"id": expense_id})
         if not existing:
             raise NotFoundError("expense", expense_id)

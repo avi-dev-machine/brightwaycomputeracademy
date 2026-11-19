@@ -119,13 +119,16 @@ const MONTHS_LIST = [
 ];
 
 export default function MonthlyFeeManagementPage() {
-  const [selectedYear, setSelectedYear] = useState<number>(2027);
-  const [selectedMonthNum, setSelectedMonthNum] = useState<string>("12");
+  const [selectedYear, setSelectedYear] = useState<number>(2026);
+  const [selectedMonthNum, setSelectedMonthNum] = useState<string>("06");
   const activeMonth = `${selectedYear}-${selectedMonthNum}`;
 
   const [viewTab, setViewTab] = useState<
     "MATRIX_12M" | "MONTH_DETAIL" | "DAILY_REPORT" | "CORRECTION_HISTORY"
   >("MATRIX_12M");
+  const [categoryFilter, setCategoryFilter] = useState<
+    "ALL" | "CERT" | "NON-CERT"
+  >("ALL");
   const [statusFilter, setStatusFilter] = useState<string>("ALL");
   const [search, setSearch] = useState<string>("");
   const [page, setPage] = useState<number>(1);
@@ -157,6 +160,7 @@ export default function MonthlyFeeManagementPage() {
         "fee-ledger-12m",
         selectedYear,
         activeMonth,
+        categoryFilter,
         statusFilter,
         search,
         page,
@@ -165,6 +169,7 @@ export default function MonthlyFeeManagementPage() {
         api.get<FeeLedgerMatrixResponse>("/v1/reports/fee-ledger", {
           year: selectedYear,
           active_month: activeMonth,
+          batch: categoryFilter !== "ALL" ? categoryFilter : undefined,
           status_filter: statusFilter !== "ALL" ? statusFilter : undefined,
           search: search.trim() || undefined,
           page,
@@ -271,15 +276,11 @@ export default function MonthlyFeeManagementPage() {
               }}
               className="bg-transparent text-xs font-extrabold text-white focus:outline-hidden cursor-pointer"
             >
-              <option value={2026} className="text-slate-900">
-                2026
-              </option>
-              <option value={2027} className="text-slate-900">
-                2027
-              </option>
-              <option value={2028} className="text-slate-900">
-                2028
-              </option>
+              {[2023, 2024, 2025, 2026, 2027].map((yr) => (
+                <option key={yr} value={yr} className="text-slate-900">
+                  {yr}
+                </option>
+              ))}
             </select>
           </div>
 
@@ -497,6 +498,27 @@ export default function MonthlyFeeManagementPage() {
                 placeholder="Search Student or ID..."
                 className="w-full rounded-xl border border-slate-300 pl-9 pr-3 py-1.5 text-xs font-medium"
               />
+            </div>
+
+            {/* CERT vs NON-CERT Only Category Filter */}
+            <div className="flex rounded-xl bg-slate-100 p-1 border border-slate-200">
+              {(["ALL", "CERT", "NON-CERT"] as const).map((cat) => (
+                <button
+                  key={cat}
+                  type="button"
+                  onClick={() => {
+                    setCategoryFilter(cat);
+                    setPage(1);
+                  }}
+                  className={`rounded-lg px-3 py-1 text-xs font-extrabold cursor-pointer ${
+                    categoryFilter === cat
+                      ? "bg-[#2563EB] text-white"
+                      : "text-slate-600"
+                  }`}
+                >
+                  {cat === "ALL" ? "All (CERT & NON-CERT)" : cat}
+                </button>
+              ))}
             </div>
 
             <div className="flex rounded-xl bg-slate-100 p-1 border border-slate-200">

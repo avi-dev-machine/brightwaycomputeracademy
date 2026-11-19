@@ -3,8 +3,7 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Lock,
-  Unlock,
+  ShieldCheck,
   TrendingUp,
   TrendingDown,
   Wallet,
@@ -12,7 +11,6 @@ import {
   Trash2,
   Calendar,
   Loader2,
-  ShieldAlert,
   Banknote,
   CreditCard,
 } from "lucide-react";
@@ -87,15 +85,9 @@ const MONTHS_LIST = [
 ];
 
 export default function CashFlowManagementPage() {
-  const [cashflowPassword, setCashflowPassword] = useState("");
-  const [unlockedPassword, setUnlockedPassword] = useState<string | null>(null);
-  const [isVerifying, setIsVerifying] = useState(false);
-
-  const [selectedYear, setSelectedYear] = useState<number>(2027);
-  const [selectedMonthNum, setSelectedMonthNum] = useState<string>("12");
-  const [selectedDate, setSelectedDate] = useState<string>(
-    new Date().toISOString().slice(0, 10)
-  );
+  const [selectedYear, setSelectedYear] = useState<number>(2026);
+  const [selectedMonthNum, setSelectedMonthNum] = useState<string>("06");
+  const [selectedDate, setSelectedDate] = useState<string>("2026-06-10");
   const activeMonth = `${selectedYear}-${selectedMonthNum}`;
 
   // New Expense Form state
@@ -103,46 +95,16 @@ export default function CashFlowManagementPage() {
   const [expCategory, setExpCategory] = useState("INSTITUTE_EXPENSE");
   const [expAmount, setExpAmount] = useState("");
   const [expMode, setExpMode] = useState("CASH");
-  const [expDate, setExpDate] = useState(
-    new Date().toISOString().slice(0, 10)
-  );
+  const [expDate, setExpDate] = useState("2026-06-10");
   const [isAddingExpense, setIsAddingExpense] = useState(false);
 
   const queryClient = useQueryClient();
   const { toast } = useToast();
 
-  const handleUnlock = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setIsVerifying(true);
-    try {
-      await api.post("/v1/admin/cash-flow/unlock", {
-        password: cashflowPassword.trim(),
-      });
-      setUnlockedPassword(cashflowPassword.trim());
-      toast({
-        type: "success",
-        title: "Cash Flow Unlocked",
-        description: "Super Admin secondary security verification passed.",
-      });
-    } catch (err) {
-      toast({
-        type: "error",
-        title: "Access Denied",
-        description:
-          err instanceof Error
-            ? err.message
-            : "Invalid Cash Flow security password.",
-      });
-    } finally {
-      setIsVerifying(false);
-    }
-  };
-
   const { data: cashflow, isLoading } = useQuery<CashFlowDashboard>({
     queryKey: [
       "admin",
       "cash-flow",
-      unlockedPassword,
       selectedYear,
       activeMonth,
       selectedDate,
@@ -152,27 +114,20 @@ export default function CashFlowManagementPage() {
         year: selectedYear,
         month: activeMonth,
         date: selectedDate,
-        cashflow_password: unlockedPassword || "",
       }),
-    enabled: !!unlockedPassword,
   });
 
   const handleAddExpense = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!unlockedPassword) return;
     setIsAddingExpense(true);
     try {
-      await api.post(
-        "/v1/admin/cash-flow/expenses",
-        {
-          description: expDesc.trim(),
-          category: expCategory,
-          amount: Number(expAmount),
-          payment_mode: expMode,
-          expense_date: expDate,
-        },
-        { query: { cashflow_password: unlockedPassword } }
-      );
+      await api.post("/v1/admin/cash-flow/expenses", {
+        description: expDesc.trim(),
+        category: expCategory,
+        amount: Number(expAmount),
+        payment_mode: expMode,
+        expense_date: expDate,
+      });
       toast({
         type: "success",
         title: "Expense Recorded",
@@ -194,11 +149,8 @@ export default function CashFlowManagementPage() {
   };
 
   const handleDeleteExpense = async (expenseId: string) => {
-    if (!unlockedPassword) return;
     try {
-      await api.delete(`/v1/admin/cash-flow/expenses/${expenseId}`, {
-        query: { cashflow_password: unlockedPassword },
-      });
+      await api.delete(`/v1/admin/cash-flow/expenses/${expenseId}`);
       toast({
         type: "success",
         title: "Expense Deleted",
@@ -215,74 +167,14 @@ export default function CashFlowManagementPage() {
     }
   };
 
-  // Password Gate Screen before opening Cash Flow
-  if (!unlockedPassword) {
-    return (
-      <div className="mx-auto max-w-md py-16">
-        <form
-          onSubmit={handleUnlock}
-          className="rounded-2xl border-2 border-[#1E3A8A]/20 bg-white p-8 shadow-xl space-y-5 text-center"
-        >
-          <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-[#1E3A8A] text-[#FBBF24] shadow-md">
-            <Lock className="h-8 w-8" />
-          </div>
-          <div className="space-y-1.5">
-            <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 text-amber-900 px-3 py-0.5 text-xs font-extrabold uppercase">
-              <ShieldAlert className="h-3.5 w-3.5 text-[#F59E0B]" />
-              Super Admin Exclusive • Secondary Lock
-            </span>
-            <h1 className="font-display text-2xl font-black text-[#1E3A8A]">
-              Cash Flow Management
-            </h1>
-            <p className="text-xs text-slate-600 leading-relaxed">
-              Enter the additional Cash Flow security password to access institute income, expenses, and net balance reports.
-            </p>
-          </div>
-
-          <div className="text-left">
-            <label className="block text-xs font-bold text-slate-700 mb-1">
-              Cash Flow Security Password *
-            </label>
-            <input
-              type="password"
-              required
-              autoFocus
-              value={cashflowPassword}
-              onChange={(e) => setCashflowPassword(e.target.value)}
-              placeholder="Enter Cash Flow Password (e.g. Brightway@Cash2026!)"
-              className="w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-xs font-mono font-bold focus:border-[#2563EB] focus:outline-hidden"
-            />
-          </div>
-
-          <button
-            type="submit"
-            disabled={isVerifying}
-            className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#1E3A8A] hover:bg-[#2563EB] text-white font-extrabold py-3 px-4 text-xs shadow-md transition-colors cursor-pointer"
-          >
-            {isVerifying ? (
-              <Loader2 className="h-4 w-4 animate-spin text-[#FBBF24]" />
-            ) : (
-              <Unlock className="h-4 w-4 text-[#FBBF24]" />
-            )}
-            <span>
-              {isVerifying
-                ? "Verifying Security Password..."
-                : "Unlock Cash Flow Management"}
-            </span>
-          </button>
-        </form>
-      </div>
-    );
-  }
-
   return (
     <div className="space-y-6">
       {/* Header */}
       <div className="rounded-2xl bg-gradient-to-r from-[#0F172A] via-[#1E3A8A] to-[#2563EB] p-6 text-white shadow-lg flex flex-col lg:flex-row lg:items-center justify-between gap-6">
         <div>
           <span className="inline-flex items-center gap-1.5 rounded-full bg-[#F59E0B] text-slate-950 px-3 py-0.5 text-xs font-extrabold uppercase">
-            <Unlock className="h-3.5 w-3.5" />
-            Super Admin Cash Flow Management (Unlocked)
+            <ShieldCheck className="h-3.5 w-3.5" />
+            Super Admin Exclusive • 3-Tier Access Control
           </span>
           <h1 className="mt-2 font-display text-2xl sm:text-3xl font-extrabold">
             Institute Cash Flow, Income &amp; Expense Ledger
@@ -301,15 +193,11 @@ export default function CashFlowManagementPage() {
               onChange={(e) => setSelectedYear(Number(e.target.value))}
               className="bg-transparent text-xs font-extrabold text-white focus:outline-hidden cursor-pointer"
             >
-              <option value={2026} className="text-slate-900">
-                2026
-              </option>
-              <option value={2027} className="text-slate-900">
-                2027
-              </option>
-              <option value={2028} className="text-slate-900">
-                2028
-              </option>
+              {[2023, 2024, 2025, 2026, 2027].map((yr) => (
+                <option key={yr} value={yr} className="text-slate-900">
+                  {yr}
+                </option>
+              ))}
             </select>
           </div>
 
@@ -337,18 +225,6 @@ export default function CashFlowManagementPage() {
               className="bg-transparent text-xs font-extrabold text-white focus:outline-hidden"
             />
           </div>
-
-          <button
-            type="button"
-            onClick={() => {
-              setUnlockedPassword(null);
-              setCashflowPassword("");
-            }}
-            className="inline-flex items-center gap-1.5 rounded-xl bg-red-500/90 hover:bg-red-600 text-white px-3.5 py-2 text-xs font-extrabold cursor-pointer"
-          >
-            <Lock className="h-3.5 w-3.5" />
-            <span>Lock Cash Flow</span>
-          </button>
         </div>
       </div>
 
@@ -447,7 +323,6 @@ export default function CashFlowManagementPage() {
 
           {/* Daily, Monthly & Yearly Cash Flow Comparison Cards */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            {/* Daily Cash Flow */}
             <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-xs space-y-2">
               <span className="rounded-lg bg-blue-50 text-[#1E3A8A] px-2.5 py-0.5 text-[11px] font-extrabold uppercase">
                 Daily Cash Flow ({cashflow.daily.date})
@@ -474,7 +349,6 @@ export default function CashFlowManagementPage() {
               </div>
             </div>
 
-            {/* Monthly Cash Flow */}
             <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-xs space-y-2">
               <span className="rounded-lg bg-amber-100 text-amber-900 px-2.5 py-0.5 text-[11px] font-extrabold uppercase">
                 Monthly Cash Flow ({cashflow.monthly.month_label})
@@ -501,7 +375,6 @@ export default function CashFlowManagementPage() {
               </div>
             </div>
 
-            {/* Yearly Cash Flow */}
             <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-xs space-y-2">
               <span className="rounded-lg bg-emerald-100 text-emerald-900 px-2.5 py-0.5 text-[11px] font-extrabold uppercase">
                 Yearly Cash Flow ({cashflow.yearly.year})

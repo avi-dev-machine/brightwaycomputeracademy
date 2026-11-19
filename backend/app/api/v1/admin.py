@@ -359,7 +359,7 @@ def unlock_cash_flow(
 def get_cash_flow(
     user: SuperAdminDep,
     container: ContainerDep,
-    year: int = 2027,
+    year: int = 2026,
     month: str | None = None,
     date: str | None = None,
     cashflow_password: str | None = None,

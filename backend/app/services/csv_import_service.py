@@ -2,8 +2,10 @@
 
 Supports:
 1. Uploading .xlsx Excel workbooks or .csv files for bulk student import.
-2. Duplicate Student ID validation and detailed row-by-row import error reporting.
-3. Exporting Student Records, Monthly Fee Ledgers, Payment History, and Cash Flow in .xlsx and .csv formats.
+2. Populating all monthly fee records (JAN..DEC across years) from the CERT and NON-CERT CSV files into `fee_payments`.
+3. Categorizing students strictly into the two filters: `CERT` and `NON-CERT`.
+4. Duplicate Student ID validation and detailed row-by-row import error reporting.
+5. Exporting Student Records, Monthly Fee Ledgers, and Payment History in .xlsx and .csv formats.
 """
 
 import io
@@ -23,7 +25,7 @@ from app.utils.excel_io import (
     xlsx_bytes_to_csv_bytes,
 )
 
-BATCH_WRITE_SIZE = 250
+BATCH_WRITE_SIZE = 500
 
 
 class CsvImportService:
@@ -35,14 +37,13 @@ class CsvImportService:
         binary_stream: BinaryIO,
         *,
         filename: str = "students.xlsx",
-        year: int = 2027,
+        year: int = 2026,
         dry_run: bool = False,
     ) -> dict[str, Any]:
         raw_bytes = binary_stream.read()
         if not raw_bytes:
             raise ValidationError("Uploaded Excel/CSV file is empty.")
 
-        # Automatically convert .xlsx (ZIP magic bytes PK\x03\x04) to CSV stream
         is_xlsx = filename.lower().endswith(".xlsx") or raw_bytes[:4] == b"PK\x03\x04"
         if is_xlsx:
             try:
@@ -60,23 +61,40 @@ class CsvImportService:
         updated_rows = 0
         duplicate_rows = 0
         failed_rows = 0
+        fee_records_upserted = 0
         errors: list[dict[str, Any]] = []
         sample_students: list[dict[str, Any]] = []
 
         fname_l = filename.lower()
-        default_batch = (
-            "NON-CERT"
-            if "non" in fname_l
-            else ("CERT" if "cert" in fname_l else "GENERAL")
-        )
+        default_batch = "NON-CERT" if "non" in fname_l else "CERT"
 
         now = datetime.now(tz=UTC)
         active_month = get_active_month()
         student_ops: list[UpdateOne] = []
+        fee_ops: list[UpdateOne] = []
         seen_ids_in_file: set[str] = set()
 
+        # Pre-index existing student UUIDs so monthly fee records bind to the exact student_key
+        existing_by_sid: dict[str, str] = {}
+        existing_by_tuple: dict[tuple[str, str, str], str] = {}
+        if not dry_run:
+            for doc in self._db["students"].find(
+                {}, {"id": 1, "student_id": 1, "name": 1, "course": 1, "contact_number": 1}
+            ):
+                s_uuid = str(doc["id"])
+                sid = doc.get("student_id") or ""
+                if sid:
+                    existing_by_sid[sid] = s_uuid
+                else:
+                    key_t = (
+                        doc.get("name") or "",
+                        doc.get("course") or "",
+                        doc.get("contact_number") or "",
+                    )
+                    existing_by_tuple[key_t] = s_uuid
+
         def _flush_batches() -> None:
-            nonlocal inserted_rows, updated_rows
+            nonlocal inserted_rows, updated_rows, fee_records_upserted
             if student_ops:
                 res = self._db["students"].bulk_write(student_ops, ordered=False)
                 inserted_rows += res.upserted_count
@@ -84,6 +102,10 @@ class CsvImportService:
                     res.matched_count - res.modified_count
                 )
                 student_ops.clear()
+            if fee_ops:
+                f_res = self._db["fee_payments"].bulk_write(fee_ops, ordered=False)
+                fee_records_upserted += f_res.upserted_count + f_res.modified_count
+                fee_ops.clear()
 
         for idx, rec in enumerate(
             iter_parse_csv_stream(
@@ -107,16 +129,18 @@ class CsvImportService:
                     seen_ids_in_file.add(rec.student_id)
 
                 if not dry_run:
-                    match_filter: dict[str, Any] = (
-                        {"student_id": rec.student_id}
-                        if rec.student_id
-                        else {
-                            "name": rec.name,
-                            "course": rec.course,
-                            "contact_number": rec.contact_number,
-                            "student_id": "",
-                        }
-                    )
+                    if rec.student_id:
+                        student_uuid_str = existing_by_sid.get(rec.student_id) or str(
+                            uuid4()
+                        )
+                        existing_by_sid[rec.student_id] = student_uuid_str
+                        match_filter: dict[str, Any] = {"student_id": rec.student_id}
+                    else:
+                        key_t = (rec.name, rec.course, rec.contact_number)
+                        student_uuid_str = str(uuid4())
+                        existing_by_tuple[key_t] = student_uuid_str
+                        match_filter = {"id": student_uuid_str}
+
                     student_ops.append(
                         UpdateOne(
                             match_filter,
@@ -127,17 +151,18 @@ class CsvImportService:
                                     "password": rec.password,
                                     "contact_number": rec.contact_number,
                                     "course": rec.course,
-                                    "batch": rec.course,
+                                    "batch": rec.batch,
+                                    "sub_course": rec.sub_course,
                                     "monthly_fee": float(rec.monthly_fee),
+                                    "fee_status": rec.fee_status,
+                                    "month": active_month,
                                 },
                                 "$setOnInsert": {
-                                    "id": str(uuid4()),
+                                    "id": student_uuid_str,
                                     "parent_name": "",
                                     "dob": "",
                                     "address": "",
-                                    "admission_date": "2027-01-01",
-                                    "fee_status": rec.fee_status,
-                                    "month": active_month,
+                                    "admission_date": "2026-01-10",
                                     "photo_url": None,
                                     "active": True,
                                     "status": "ACTIVE",
@@ -148,7 +173,44 @@ class CsvImportService:
                         )
                     )
 
-                    if len(student_ops) >= BATCH_WRITE_SIZE:
+                    # Populate all monthly fee payment records from the CSV row
+                    fee_amt = float(rec.monthly_fee)
+                    for ym_key, cell_note in rec.monthly_payments.items():
+                        fee_ops.append(
+                            UpdateOne(
+                                {
+                                    "student_key": student_uuid_str,
+                                    "month_year": ym_key,
+                                },
+                                {
+                                    "$set": {
+                                        "student_key": student_uuid_str,
+                                        "student_id": rec.student_id,
+                                        "student_name": rec.name,
+                                        "course": rec.course,
+                                        "batch": rec.batch,
+                                        "amount": fee_amt,
+                                        "month_year": ym_key,
+                                        "status": "PAID",
+                                        "payment_mode": "CASH",
+                                        "received_by": f"Paid ({cell_note})",
+                                        "remarks": cell_note,
+                                        "payment_date": f"{ym_key}-10T10:00:00+00:00",
+                                    },
+                                    "$setOnInsert": {
+                                        "id": str(uuid4()),
+                                        "razorpay_order_id": None,
+                                        "razorpay_payment_id": f"CSV-{ym_key}-{uuid4().hex[:6].upper()}",
+                                    },
+                                },
+                                upsert=True,
+                            )
+                        )
+
+                    if (
+                        len(student_ops) >= BATCH_WRITE_SIZE
+                        or len(fee_ops) >= BATCH_WRITE_SIZE * 4
+                    ):
                         _flush_batches()
                 else:
                     inserted_rows += 1
@@ -161,7 +223,7 @@ class CsvImportService:
                             "password": rec.password,
                             "contact_number": rec.contact_number,
                             "course": rec.course,
-                            "batch": rec.course,
+                            "batch": rec.batch,
                             "monthly_fee": float(rec.monthly_fee),
                             "fee_status": rec.fee_status,
                             "month": active_month,
@@ -199,7 +261,7 @@ class CsvImportService:
             "duplicate_rows": duplicate_rows,
             "skipped_rows": 0,
             "failed_rows": failed_rows,
-            "fee_records_upserted": 0,
+            "fee_records_upserted": fee_records_upserted,
             "error_summary": {
                 "errors": errors[:50],
                 "sample_students": sample_students,
@@ -238,7 +300,7 @@ class CsvImportService:
         elif active_status and active_status.upper() == "INACTIVE":
             filt["active"] = False
         if course and course.upper() != "ALL":
-            filt["$or"] = [{"course": course}, {"batch": course}]
+            filt["$or"] = [{"course": course.upper()}, {"batch": course.upper()}]
 
         rows_db = list(
             self._db["students"].find(filt).sort([("name", ASCENDING)])
@@ -250,7 +312,7 @@ class CsvImportService:
             "PARENT NAME",
             "CONTACT NO.",
             "ADDRESS",
-            "COURSE",
+            "CATEGORY (CERT / NON-CERT)",
             "ADMISSION DATE",
             "MONTHLY FEE (INR)",
             "STATUS",
@@ -275,8 +337,8 @@ class CsvImportService:
                     s.get("parent_name") or "",
                     contact,
                     s.get("address") or "",
-                    s.get("course") or s.get("batch") or "GENERAL",
-                    str(s.get("admission_date") or "2027-01-01")[:10],
+                    s.get("course") or s.get("batch") or "CERT",
+                    str(s.get("admission_date") or "2026-01-10")[:10],
                     float(s.get("monthly_fee", 600)),
                     "ACTIVE" if is_act else "INACTIVE",
                 ]
@@ -297,7 +359,7 @@ class CsvImportService:
     def export_monthly_fees(
         self,
         *,
-        year: int = 2027,
+        year: int = 2026,
         month_year: str | None = None,
         fmt: str = "xlsx",
     ) -> tuple[bytes, str, str]:
@@ -316,12 +378,12 @@ class CsvImportService:
         headers = [
             "STUDENT NAME",
             "STUDENT ID",
-            "COURSE",
+            "CATEGORY",
             "MONTH",
             "AMOUNT (INR)",
             "PAID / UNPAID STATUS",
             "PAYMENT MODE",
-            "RECEIVED BY",
+            "RECEIVED BY / NOTE",
             "PAYMENT DATE",
             "TRANSACTION ID",
         ]
@@ -341,13 +403,13 @@ class CsvImportService:
                 [
                     s.get("name") or "",
                     code,
-                    s.get("course") or s.get("batch") or "GENERAL",
+                    s.get("course") or s.get("batch") or "CERT",
                     format_month_label(resolved_month),
                     float(fp.get("amount", s.get("monthly_fee", 600)))
                     if fp
                     else float(s.get("monthly_fee", 600)),
                     "PAID" if is_paid else "UNPAID",
-                    (fp.get("payment_mode") or "RAZORPAY") if is_paid else "-",
+                    (fp.get("payment_mode") or "CASH") if is_paid else "-",
                     (fp.get("received_by") or "Admin") if is_paid else "-",
                     p_date_str if is_paid else "-",
                     (fp.get("razorpay_payment_id") or "-") if is_paid else "-",
@@ -374,16 +436,16 @@ class CsvImportService:
         fps = list(
             self._db["fee_payments"]
             .find({"status": "PAID"})
-            .sort([("payment_date", -1)])
+            .sort([("month_year", -1)])
         )
         headers = [
             "STUDENT NAME",
             "STUDENT ID",
-            "COURSE",
+            "CATEGORY",
             "PAYMENT MONTH",
             "AMOUNT (INR)",
             "PAYMENT MODE",
-            "RECEIVED BY",
+            "RECEIVED BY / NOTE",
             "TRANSACTION ID",
             "PAYMENT DATE",
             "STATUS",
@@ -400,7 +462,7 @@ class CsvImportService:
                 [
                     fp.get("student_name") or "",
                     fp.get("student_id") or "",
-                    fp.get("course") or "GENERAL",
+                    fp.get("course") or "CERT",
                     format_month_label(fp.get("month_year") or ""),
                     float(fp.get("amount", 0)),
                     fp.get("payment_mode") or "CASH",

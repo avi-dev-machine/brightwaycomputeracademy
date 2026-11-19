@@ -62,7 +62,26 @@ class ReportService:
             if fp.get("student_id"):
                 active_fps_by_code[fp["student_id"]] = fp
 
-        course_stats: dict[str, dict[str, Any]] = {}
+        course_stats: dict[str, dict[str, Any]] = {
+            "CERT": {
+                "batch": "CERT",
+                "course": "CERT",
+                "student_count": 0,
+                "paid_count": 0,
+                "unpaid_count": 0,
+                "collected_amount": Decimal("0.00"),
+                "pending_amount": Decimal("0.00"),
+            },
+            "NON-CERT": {
+                "batch": "NON-CERT",
+                "course": "NON-CERT",
+                "student_count": 0,
+                "paid_count": 0,
+                "unpaid_count": 0,
+                "collected_amount": Decimal("0.00"),
+                "pending_amount": Decimal("0.00"),
+            },
+        }
         total_students = 0
         active_students_count = 0
         inactive_students_count = 0
@@ -76,7 +95,8 @@ class ReportService:
         for s in all_students:
             s_uuid = str(s["id"])
             code = s.get("student_id") or ""
-            c_name = s.get("course") or s.get("batch") or "GENERAL"
+            raw_cat = (s.get("batch") or s.get("course") or "CERT").strip().upper()
+            c_name = "NON-CERT" if "NON" in raw_cat else "CERT"
             is_active = (
                 bool(s["active"])
                 if "active" in s and s["active"] is not None
@@ -224,7 +244,7 @@ class ReportService:
     def fee_ledger_matrix(
         self,
         *,
-        year: int = 2027,
+        year: int = 2026,
         active_month: str | None = None,
         batch: str | None = None,
         search: str | None = None,

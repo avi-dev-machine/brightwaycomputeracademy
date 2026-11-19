@@ -127,8 +127,8 @@ const MONTHS_LIST = [
 ];
 
 export default function AdminDashboardPage() {
-  const [selectedYear, setSelectedYear] = useState<string>("2027");
-  const [selectedMonthNum, setSelectedMonthNum] = useState<string>("12");
+  const [selectedYear, setSelectedYear] = useState<string>("2026");
+  const [selectedMonthNum, setSelectedMonthNum] = useState<string>("06");
   const activeMonth = `${selectedYear}-${selectedMonthNum}`;
 
   const [selectedCourse, setSelectedCourse] = useState<string>("ALL");
@@ -152,8 +152,8 @@ export default function AdminDashboardPage() {
   const [newDob, setNewDob] = useState("");
   const [newContact, setNewContact] = useState("");
   const [newAddress, setNewAddress] = useState("");
-  const [newCourse, setNewCourse] = useState("ADOAP");
-  const [newAdmissionDate, setNewAdmissionDate] = useState("2027-12-01");
+  const [newCourse, setNewCourse] = useState("CERT");
+  const [newAdmissionDate, setNewAdmissionDate] = useState("2026-06-01");
   const [newFee, setNewFee] = useState("600");
   const [newFeeStatus, setNewFeeStatus] = useState<"UNPAID" | "PAID">("UNPAID");
   const [newActive, setNewActive] = useState<boolean>(true);
@@ -636,14 +636,20 @@ export default function AdminDashboardPage() {
                 }}
                 className="bg-transparent text-xs font-extrabold text-white focus:outline-hidden cursor-pointer"
               >
+                <option value="2023" className="text-slate-900">
+                  2023
+                </option>
+                <option value="2024" className="text-slate-900">
+                  2024
+                </option>
+                <option value="2025" className="text-slate-900">
+                  2025
+                </option>
                 <option value="2026" className="text-slate-900">
                   2026
                 </option>
                 <option value="2027" className="text-slate-900">
                   2027
-                </option>
-                <option value="2028" className="text-slate-900">
-                  2028
                 </option>
               </select>
             </div>
@@ -1013,15 +1019,16 @@ export default function AdminDashboardPage() {
             </div>
             <div>
               <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                Course Name
+                Category (CERT / NON-CERT)
               </label>
-              <input
-                type="text"
+              <select
                 value={newCourse}
-                onChange={(e) => setNewCourse(e.target.value.toUpperCase())}
-                placeholder="e.g. ADOAP, DCAE, DDTP"
-                className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-bold"
-              />
+                onChange={(e) => setNewCourse(e.target.value)}
+                className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs font-extrabold text-[#1E3A8A]"
+              >
+                <option value="CERT">CERT (Certificate Course)</option>
+                <option value="NON-CERT">NON-CERT (Non-Certificate Course)</option>
+              </select>
             </div>
             <div>
               <label className="block text-[11px] font-bold text-slate-700 mb-1">
@@ -1207,14 +1214,16 @@ export default function AdminDashboardPage() {
 
               <div>
                 <label className="block text-xs font-bold text-slate-700 mb-1">
-                  Course Name
+                  Category (CERT / NON-CERT)
                 </label>
-                <input
-                  type="text"
-                  value={editCourse}
-                  onChange={(e) => setEditCourse(e.target.value.toUpperCase())}
-                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs font-bold"
-                />
+                <select
+                  value={editCourse.includes("NON") ? "NON-CERT" : "CERT"}
+                  onChange={(e) => setEditCourse(e.target.value)}
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs font-extrabold text-[#1E3A8A]"
+                >
+                  <option value="CERT">CERT (Certificate Course)</option>
+                  <option value="NON-CERT">NON-CERT (Non-Certificate Course)</option>
+                </select>
               </div>
 
               <div>
@@ -1346,13 +1355,13 @@ export default function AdminDashboardPage() {
         </div>
       )}
 
-      {/* Quick Filters by Course */}
-      {analytics && analytics.batches.length > 0 && (
+      {/* Quick Filters by Category: CERT & NON-CERT Only */}
+      {analytics && (
         <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-xs space-y-3">
           <div className="flex items-center justify-between">
             <span className="inline-flex items-center gap-1.5 text-xs font-extrabold uppercase tracking-wider text-[#1E3A8A]">
               <Filter className="h-3.5 w-3.5 text-[#F59E0B]" />
-              Filter by Course ({analytics.batches.length} Courses)
+              Filter by Student Category (CERT vs NON-CERT Only)
             </span>
             {selectedCourse !== "ALL" && (
               <button
@@ -1363,52 +1372,58 @@ export default function AdminDashboardPage() {
                 }}
                 className="text-xs font-bold text-[#2563EB] hover:underline cursor-pointer"
               >
-                Show All Courses
+                Show All Students
               </button>
             )}
           </div>
 
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-wrap gap-2.5">
             <button
               type="button"
               onClick={() => {
                 setSelectedCourse("ALL");
                 setPage(1);
               }}
-              className={`rounded-xl px-3.5 py-1.5 text-xs font-extrabold transition-all cursor-pointer ${
+              className={`rounded-xl px-4 py-2 text-xs font-extrabold transition-all cursor-pointer ${
                 selectedCourse === "ALL"
-                  ? "bg-[#1E3A8A] text-white"
+                  ? "bg-[#1E3A8A] text-white shadow-xs"
                   : "bg-slate-100 text-slate-700 hover:bg-slate-200"
               }`}
             >
-              All Courses ({analytics.total_students})
+              All Students ({analytics.total_students})
             </button>
 
-            {analytics.batches.map((b) => {
-              const active = selectedCourse === b.batch;
+            {(["CERT", "NON-CERT"] as const).map((cat) => {
+              const active = selectedCourse === cat;
+              const match = analytics.batches.find((b) => b.batch === cat);
+              const count = match?.student_count ?? 0;
               return (
                 <button
-                  key={b.batch}
+                  key={cat}
                   type="button"
                   onClick={() => {
-                    setSelectedCourse(b.batch);
+                    setSelectedCourse(cat);
                     setPage(1);
                   }}
-                  className={`rounded-xl px-3 py-1.5 text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+                  className={`rounded-xl px-4 py-2 text-xs font-extrabold transition-all cursor-pointer flex items-center gap-2 ${
                     active
-                      ? "bg-[#2563EB] text-white"
+                      ? "bg-[#2563EB] text-white shadow-xs"
                       : "bg-slate-100 text-slate-700 hover:bg-blue-50 hover:text-[#1E3A8A]"
                   }`}
                 >
-                  <span>{b.batch}</span>
+                  <span>
+                    {cat === "CERT"
+                      ? "CERT (Certificate Students)"
+                      : "NON-CERT (Non-Certificate Students)"}
+                  </span>
                   <span
-                    className={`rounded-full px-1.5 text-[10px] font-extrabold ${
+                    className={`rounded-full px-2 py-0.5 text-[10px] font-extrabold ${
                       active
                         ? "bg-[#FBBF24] text-slate-950"
-                        : "bg-white text-slate-600"
+                        : "bg-white text-slate-700"
                     }`}
                   >
-                    {b.student_count}
+                    {count}
                   </span>
                 </button>
               );
